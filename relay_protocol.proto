@@ -1,0 +1,189 @@
+syntax = "proto3";
+
+// ============================================================================
+// 拾光盲中继契约（Phase 0 冻结基线，2026-10-09 用户拍板）
+// 设计 SSOT: docs/design/collab-schedule-draft.md
+// 本文件是双端唯一事实源；Go 出 types.pb.go / Flutter 出 types.pb.dart，
+// 双方只面向生成产物编程。契约变更须重新生成并打 tag。
+// ============================================================================
+
+package shiguang.relay.v1;
+
+// ---------------------------------------------------------------------------
+// 外层信封（服务端可见明文，§2.1 / §4.2）
+// 服务端只按 recipient_id / bundle_id 路由 + 盲状态机算术；
+// 一切内容在 encrypted_payload 内，服务端不可解密。
+// ---------------------------------------------------------------------------
+message Envelope {
+  string message_id = 1;                 // 全局唯一，幂等防重
+  string sender_id = 2;                  // account_id（出设备即密文）
+  string recipient_id = 3;               // 点对点瞬时信令用；协同事件以 bundle_id 广播
+  string bundle_id = 4;                  // 协同方案包；空 = 瞬时信令
+  ActionType action_type = 5;            // 服务端可见枚举（§2.3 元数据）
+  string step_id = 6;                    // 靶向步骤 / 候选 slot_id（Consensus）
+  int64 seq_id = 7;                      // 服务端行锁取号回填（§5.1）
+  int32 key_ver = 8;                     // 加密版本（§5.2 Key Ring 回放）
+  Visibility visibility = 9;             // 拒绝理由可见面（§3.5）
+  bytes iv = 10;                         // AES-256-GCM 12B IV（绝不复用）
+  bytes auth_tag = 11;                   // 16B GCM AuthTag（防篡改）
+  bytes encrypted_payload = 12;          // 端到端密文（512B PKCS#7 对齐，§2.3）
+  TopologySkeleton topology_skeleton = 13; // PROPOSE/PATCH 同事务原子更新（§4.2）
+  repeated MemberKeyEnvelope member_key_envelopes = 14; // 伙伴密钥通道（§10.3）
+  string client_msg_id = 15;             // 防重放幂等键（§1.4，Redis 300s 去重）
+  int64 client_ts = 16;                  // 客户端时间戳（仅 UI，不仲裁）
+  ProposalType proposal_type = 17;       // DIRECTIVE / CONSENSUS（§3.2 双模）
+}
+
+enum ActionType {
+  ACTION_UNSPECIFIED = 0;
+  PROPOSE = 1;             // 创建方案包（携 topology_skeleton）
+  ACCEPT = 2;             // 同意步骤（Directive）
+  REJECT = 3;             // 拒绝（带 reason 枚举）
+  PATCH_TIME = 4;         // 改期（回 PENDING，联动 PENDING_RECHECK）
+  REASSIGN = 5;           // 转派责任人
+  MAKE_OPTIONAL = 6;      // 降级可选
+  PRUNE = 7;              // 裁撤步骤
+  CANCEL = 8;             // 发起人终止
+  REOPEN = 9;             // 紧急退回（CONFIRMED→STALLED）
+  VOTE = 10;              // Consensus 可用度向量
+  ADD_SLOT = 11;          // Consensus 反提议候选（≤8 上限）
+  FORCE_FINALIZE = 12;    // 落槌锁定（First-Commit-Wins，§4.4）
+  NUDGE = 13;             // 定向轻提醒
+  BYPASS = 14;            // 一键降级表决（单人 MAKE_OPTIONAL）
+  REKEY = 15;             // 成员变更前向安全
+  MEMBER_REMOVED = 16;
+  TRANSFER_INITIATOR = 17;
+  BRIEFING_UPDATE = 18;   // 方案备忘贴纸（§3.5）
+  STEP_NOTE = 19;         // 步骤问答便签 ≤50 字（§3.5）
+  FREEMASK_QUERY = 20;    // 靶向空白探测请求（§3.6）
+  FREEMASK_RESPONSE = 21; // IK_A 加密掩码响应
+  CLIENT_ACK = 22;        // 游标确认（§10.2）
+  DELIVERY_ACK = 23;      // 阅后即焚确认（§2.1）
+  PING = 24;
+}
+
+enum Visibility {
+  VISIBILITY_UNSPECIFIED = 0;
+  PUBLIC = 1;             // 全员时间轴可见（K_bundle 加密）
+  INITIATOR_ONLY = 2;     // 仅发起人可见（IK_A 单向加密，§3.5 隐私分级）
+}
+
+enum ProposalType {
+  PROPOSAL_TYPE_UNSPECIFIED = 0;
+  DIRECTIVE = 1;          // 团队调度（单中心仲裁）
+  CONSENSUS = 2;          // 生活预约（平权共识）
+}
+
+enum ReasonType {         // 拒绝双维度（§3.4），服务端可见枚举
+  REASON_UNSPECIFIED = 0;
+  TIME_CONFLICT = 1;
+  ROLE_UNWILLING = 2;
+}
+
+enum VoteValue {          // Consensus 三值（§3.2 / §10.3）
+  VOTE_UNSPECIFIED = 0;
+  OK = 1;
+  PREFER = 2;
+  NO = 3;
+}
+
+// ---------------------------------------------------------------------------
+// 拓扑骨架（服务端盲状态机算术依据，§4.2；内容加密、拓扑明文）
+// ---------------------------------------------------------------------------
+message StepSkeleton {
+  string step_id = 1;                  // 或 slot_id（Consensus 退化形态）
+  repeated string required_uids = 2;   // 必需人员 / 选民
+  int32 threshold = 3;                 // M-of-N 门限，默认 = required_uids 数
+  bool is_optional = 4;
+  string step_status = 5;              // PENDING/READY/TIME_CLASH/ROLE_CLASH/PRUNED
+  map<string, string> votes = 6;      // uid -> PREFER/OK/NO（Consensus）
+}
+
+message TopologySkeleton {
+  repeated StepSkeleton steps = 1;
+}
+
+// ---------------------------------------------------------------------------
+// 伙伴密钥通道（§10.3；K_bundle 经各成员 X3DH 公钥包裹随 PROPOSE 投递）
+// ---------------------------------------------------------------------------
+message MemberKeyEnvelope {
+  string uid = 1;
+  bytes wrapped_key = 2;
+}
+
+// ---------------------------------------------------------------------------
+// FreeMask 量化桶（§3.6 作息泄漏防线；靶向区间 + 30min 切片 + IK_A 加密）
+// ---------------------------------------------------------------------------
+message FreeMask {
+  string range_start = 1;              // RFC3339 或浮动日期，靶向候选区间
+  string range_end = 2;
+  int32 bucket_minutes = 3;            // 30
+  bytes encrypted_bitmask = 4;         // 发起人 IK_A 加密的位串
+}
+
+// ---------------------------------------------------------------------------
+// 鉴权 Challenge-Response（§1.4，双 Token）
+// ---------------------------------------------------------------------------
+message AuthChallenge {
+  string account_id = 1;
+  bytes nonce = 2;
+  int64 expires_at = 3;                // 60s 有效期
+}
+
+message AuthResponse {
+  bytes signed_nonce = 1;              // Sign(nonce + timestamp, IK_priv)
+  int64 timestamp = 2;
+  string access_token = 3;             // JWT 2h，存内存
+  string refresh_token = 4;            // 存 secure_storage
+}
+
+// ---------------------------------------------------------------------------
+// 注册（PoP 自签 + PreKey + PoW，§1.5 + 隐患1 Sybil 防线）
+// ---------------------------------------------------------------------------
+message PreKey {
+  int32 key_id = 1;
+  bytes public_key = 2;                // X25519
+}
+
+message RegisterRequest {
+  string account_id = 1;
+  bytes identity_key_pub = 2;          // Ed25519
+  bytes signed_pop = 3;                // Sign(account_id + ts, IK_priv) 所有权证明
+  int64 timestamp = 4;
+  bytes signed_prekey_pub = 5;         // SPK X25519
+  repeated PreKey one_time_prekeys = 6;// ≤100 OPK
+  string pow_challenge = 7;            // 服务端签发（HMAC 签名 + 有效期）
+  string pow_solution = 8;             // SHA-256 前导 4 个 0 的 nonce（Hashcash）
+  // 注：注册接口额外受 IP 级动态速率限制（单 IP ≤3–5 账号/分钟）
+}
+
+// ---------------------------------------------------------------------------
+// 好友 Ticket（§1.6 防撞库骚扰 + MITM 安全码）
+// ---------------------------------------------------------------------------
+message FriendshipTicket {
+  string account_id_b = 1;
+  bytes ephemeral_nonce = 2;
+  int64 expires_at = 3;
+  bytes signature_b = 4;               // Ticket_B 防篡改签名
+}
+
+message FriendshipRequest {
+  string ticket = 1;                   // 完整 Ticket 串（扫码/短链）
+}
+
+// ---------------------------------------------------------------------------
+// Wake Push Payload（§10.3；必须携带寻址元数据，绝不只说"你有新消息"）
+// ---------------------------------------------------------------------------
+message WakePushPayload {
+  string push_type = 1;                // BUNDLE_EVENT_WAKE
+  string bundle_id = 2;
+  int64 latest_seq_id = 3;
+}
+
+// ---------------------------------------------------------------------------
+// 同步游标确认（§10.2；避免向在线设备重复 Push）
+// ---------------------------------------------------------------------------
+message ClientAck {
+  string bundle_id = 1;
+  int64 ack_seq = 2;
+}
