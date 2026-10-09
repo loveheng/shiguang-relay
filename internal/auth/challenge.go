@@ -90,6 +90,23 @@ func (s *ChallengeStore) Consume(ctx context.Context, nonce string) (userID, pow
 	return p.UserID, p.Pow, true, nil
 }
 
+// ClaimTicketNonce：好友 Ticket 的 nonce 一次性占位（SETNX + TTL）。
+// 抢到 = 首次使用；抢不到 = 该 nonce 已用过（重放旧名片应被拒）。
+// TTL 取「距过期时间」与 5 分钟取大者：过期票本身已拦，这里只防窗口内重放。
+func (s *ChallengeStore) ClaimTicketNonce(ctx context.Context, issuer, nonce string, expiresAt int64) (bool, error) {
+	ttl := time.Until(time.Unix(expiresAt, 0))
+	if ttl < 5*time.Minute {
+		ttl = 5 * time.Minute
+	}
+	ok, err := s.rdb.SetNX(ctx, ticketNonceKey(issuer, nonce), "1", ttl).Result()
+	if err != nil {
+		return false, fmt.Errorf("占位 ticket nonce 失败: %w", err)
+	}
+	return ok, nil
+}
+
 func challengeKey(nonce string) string { return "chal:" + nonce }
+
+func ticketNonceKey(issuer, nonce string) string { return "ft:" + issuer + ":" + nonce }
 
 func idempotencyKey(msgID string) string { return "idem:" + msgID }

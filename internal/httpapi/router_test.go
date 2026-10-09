@@ -66,8 +66,10 @@ func doJSON(t *testing.T, srv *httptest.Server, method, path, body, msgID, token
 // login：走完整 Challenge-Response 拿 access_token。
 func login(t *testing.T, srv *httptest.Server, priv ed25519.PrivateKey, userID string) string {
 	t.Helper()
+	// msg_id 必须每次唯一——幂等中间件会把同 key 的第二次请求回放成首次响应
+	// （曾导致第二个 login 拿到第一个用户的 Token）
 	resp := doJSON(t, srv, http.MethodPost, "/v1/auth/challenge",
-		fmt.Sprintf(`{"user_id":%q}`, userID), "msg-challenge-1", "")
+		fmt.Sprintf(`{"user_id":%q}`, userID), randomID("m"), "")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("challenge 期望 200，实际 %d", resp.StatusCode)
@@ -88,7 +90,7 @@ func login(t *testing.T, srv *httptest.Server, priv ed25519.PrivateKey, userID s
 	body := fmt.Sprintf(`{"user_id":%q,"nonce":%q,"signed_pop":%q,"pow_solution":%q}`,
 		userID, ch.Nonce, sig, solution)
 
-	resp2 := doJSON(t, srv, http.MethodPost, "/v1/auth/login", body, "msg-login-1", "")
+	resp2 := doJSON(t, srv, http.MethodPost, "/v1/auth/login", body, randomID("m"), "")
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("login 期望 200，实际 %d", resp2.StatusCode)

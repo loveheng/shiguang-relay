@@ -21,6 +21,8 @@ type Config struct {
 	PoWRequired   bool          // 是否强制校验 PoW（本地联调可关，公网部署必须开）
 
 	RegisterLimitPerMin int // 单 IP 每分钟注册上限（fact §7.1-2：≤3~5）
+
+	FriendInviteLimitPerMin int // 单用户每分钟好友邀请上限（防撞库骚扰）
 }
 
 func env(k, def string) string {
@@ -102,5 +104,8 @@ func Load() (Config, error) {
 
 		// 单 IP 注册限流：默认 3/min（Sybil 三防线之一）
 		RegisterLimitPerMin: envInt("RELAY_REGISTER_LIMIT_PER_MIN", 3, 1, 20),
+
+		// 好友邀请限流：默认 10/min（Ticket 制已防撞库，此为第二层）
+		FriendInviteLimitPerMin: envInt("RELAY_FRIEND_INVITE_LIMIT_PER_MIN", 10, 1, 60),
 	}, nil
 }

@@ -51,6 +51,9 @@ func pgDeps(t *testing.T) (httpapi.Deps, *pgxpool.Pool) {
 		Limiter:             auth.NewRateLimiter(rdb, 100, time.Minute),
 		RegisterLimitPerMin: 100,
 		PoWRequired:         true,
+
+		Friends:                 store.FriendsStore{Pool: pool},
+		FriendInviteLimitPerMin: 100,
 	}, pool
 }
 

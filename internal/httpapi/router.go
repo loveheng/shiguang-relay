@@ -28,6 +28,10 @@ type Deps struct {
 	Users               store.UserStore
 	Limiter             *auth.RateLimiter
 	RegisterLimitPerMin int
+
+	// Phase 1.3：好友域（Ticket 制建联）
+	Friends                 store.FriendsStore
+	FriendInviteLimitPerMin int
 }
 
 func NewRouter(d Deps) http.Handler {
@@ -45,6 +49,14 @@ func NewRouter(d Deps) http.Handler {
 	mux.Handle("GET /v1/users/{user_id}/prekey", d.Idem.Wrap(http.HandlerFunc(d.handleGetPreKey)))
 	mux.Handle("POST /v1/users/me/prekeys",
 		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleRefillPreKeys))))
+
+	// Phase 1.3：好友 Ticket 建联（全部要求 Bearer）
+	mux.Handle("POST /v1/friends/invite",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleInviteFriend))))
+	mux.Handle("POST /v1/friends/accept",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleAcceptFriend))))
+	mux.Handle("GET /v1/friends",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleListFriends))))
 
 	// 受保护的业务路由：先 Bearer 鉴权，再幂等去重（顺序不可换——未鉴权流量不值得落缓存）
 	mux.Handle("POST /v1/schedule/action",

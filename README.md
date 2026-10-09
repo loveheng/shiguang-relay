@@ -55,7 +55,8 @@ export PATH="$HOME/sdk/go1.23.6/bin:$HOME/sdk/protoc/bin:$HOME/go/bin:$HOME/.pub
 - **Phase 0 契约冻结：已完成**（tag `v0.1.6-contract`，零 Go 业务代码）。
 - **Phase 1.1 鉴权闭环：已完成**——`POST /v1/auth/challenge` / `login` / `refresh` + Bearer 鉴权（401）+ `client_msg_id` 幂等去重（300s 窗口内重放原样回放）。REST 侧两个外层头：`X-Client-Msg-Id`、`X-Client-Ts`（WSS 侧走 proto `ClientFrame.client_msg_id/client_ts`，同语义）。
 - **Phase 1.2 注册与 PreKey 托管：已完成**——`POST /v1/users`（PoP 自签 + PoW + 单 IP 限流 3/min + OPK 首批 10~20，单事务落用户与密钥）、`GET /v1/users/{id}/prekey`（身份包 + `FOR UPDATE SKIP LOCKED` 原子弹出 1 个 OPK，空池恒 200 带 `OPK_EMPTY_WARNING`）、`POST /v1/users/me/prekeys`（鉴权后补仓 ≤50/批）。
-- **未开工**：1.3 好友 Ticket 建联、1.4 `schedule/action` 行锁取号落库与广播、1.5 participating/sync/vault/relay pending-ack、1.6 WSS hub、1.7 部署、1.8 网关硬约束（256KB/TTL/配额/错误码）。
+- **Phase 1.3 好友域：已完成**——`POST /v1/friends/invite {ticket, encrypted_intro}`（Ticket 规范化消息 Ed25519 验签 + 过期 + nonce 一次性 `SETNX` + 待审批配额 ≤50 + 关系去重 409）、`POST /v1/friends/accept {invite_id, accept}`（**仅被邀方**可处置，accept=false → blocked，intro 随即置 NULL）、`GET /v1/friends`（`encrypted_intro` 只在「我是被邀方 + 仍 pending」时回包）。Ticket 签名覆盖范围：`shiguang.relay.v1/friendship-ticket|<issuer>|<subject>|<nonce>|<expires_at>`（双端一字不能差）。
+- **未开工**：1.4 `schedule/action` 行锁取号落库与广播、1.5 participating/sync/vault/relay pending-ack、1.6 WSS hub、1.7 部署、1.8 网关硬约束（256KB/TTL/配额/错误码）。
 
 ## 鉴权与重放防护（契约定稿摘要，Phase 0.5）
 

@@ -55,6 +55,9 @@ func main() {
 		Users:               store.UserStore{Pool: pool},
 		Limiter:             auth.NewRateLimiter(rdb, cfg.RegisterLimitPerMin, time.Minute),
 		RegisterLimitPerMin: cfg.RegisterLimitPerMin,
+
+		Friends:                 store.FriendsStore{Pool: pool},
+		FriendInviteLimitPerMin: cfg.FriendInviteLimitPerMin,
 	}
 
 	srv := &http.Server{
