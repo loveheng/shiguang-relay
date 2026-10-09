@@ -58,6 +58,9 @@ func main() {
 
 		Friends:                 store.FriendsStore{Pool: pool},
 		FriendInviteLimitPerMin: cfg.FriendInviteLimitPerMin,
+
+		Bundles:     store.BundlesStore{Pool: pool},
+		Broadcaster: httpapi.NoopBroadcaster{}, // Phase 1.6 换 WSS Hub
 	}
 
 	srv := &http.Server{

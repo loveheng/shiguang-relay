@@ -117,12 +117,12 @@ func TestScheduleActionRequiresToken(t *testing.T) {
 		t.Fatalf("无 token 期望 401，实际 %d", resp.StatusCode)
 	}
 
-	// 带合法 token → 501（Phase 1.4 才实现业务）
+	// 带合法 token → 进入真实业务校验（Phase 1.4 已收口）：空体缺 cipher → 400
 	token := login(t, srv, priv, userID)
 	resp2 := doJSON(t, srv, http.MethodPost, "/v1/schedule/action", `{}`, "msg-2", token)
 	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("带 token 期望 501（Phase 1.4 收口），实际 %d", resp2.StatusCode)
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("带 token 但缺 cipher 期望 400，实际 %d", resp2.StatusCode)
 	}
 }
 

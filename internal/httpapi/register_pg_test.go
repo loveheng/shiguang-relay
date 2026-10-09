@@ -54,6 +54,9 @@ func pgDeps(t *testing.T) (httpapi.Deps, *pgxpool.Pool) {
 
 		Friends:                 store.FriendsStore{Pool: pool},
 		FriendInviteLimitPerMin: 100,
+
+		Bundles:     store.BundlesStore{Pool: pool},
+		Broadcaster: httpapi.NoopBroadcaster{},
 	}, pool
 }
 

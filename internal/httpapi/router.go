@@ -32,6 +32,10 @@ type Deps struct {
 	// Phase 1.3：好友域（Ticket 制建联）
 	Friends                 store.FriendsStore
 	FriendInviteLimitPerMin int
+
+	// Phase 1.4：协同动作（行锁取号 + 单事务落库）
+	Bundles     store.BundlesStore
+	Broadcaster Broadcaster // Phase 1.6 换成 WSS Hub
 }
 
 func NewRouter(d Deps) http.Handler {
@@ -163,14 +167,6 @@ func (d Deps) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	apierr.WriteJSON(w, http.StatusOK, pair)
-}
-
-func (d Deps) handleScheduleAction(w http.ResponseWriter, r *http.Request) {
-	// Phase 1.4 收口：行锁取号 → 事务写 bundles/skeletons/流水 → 广播
-	apierr.Write(w, http.StatusNotImplemented, apierr.NotImplemented,
-		"schedule action lands in Phase 1.4", map[string]any{
-			"user_id": auth.UserIDFromContext(r.Context()),
-		})
 }
 
 // decode：限长解码请求体；任何解析失败都走统一 400/413。
