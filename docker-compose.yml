@@ -1,0 +1,49 @@
+# shiguang-relay · 本地联调底座
+# Phase 0 验收线：`docker compose up -d` 起 PG + Redis（relay 服务本身在 profiles=app，
+# Phase 1 落地 cmd/relayd 后 `docker compose --profile app up -d` 起全栈）。
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: shiguang-relay-pg
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay
+      POSTGRES_DB: relay
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # 契约 DDL 首次建库：docker compose exec -T postgres psql -U relay -d relay \
+      #   -v ON_ERROR_STOP=1 -f - < migrations/0001_init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: shiguang-relay-redis
+    command: ["redis-server", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      # client_msg_id 幂等去重（SETEX 300）+ WSS 会话态；不做持久化，重启即空可接受
+      - "6379:6379"
+
+  relay:
+    profiles: ["app"]          # Phase 1 起用：docker compose --profile app up -d
+    build: .
+    container_name: shiguang-relay-app
+    environment:
+      RELAY_PG_DSN: "postgres://relay:relay@postgres:5432/relay?sslmode=disable"
+      RELAY_REDIS_ADDR: "redis:6379"
+      RELAY_LISTEN: ":8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+volumes:
+  pgdata:
