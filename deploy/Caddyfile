@@ -1,0 +1,63 @@
+# shiguang-relay 生产反代（Phase 1.7）
+# 三件事必须做对，否则协同链路会在生产环境诡异断裂：
+#   1. /ws 必须放行 Upgrade 头——少了它 WSS 握手会被反代吃掉；
+#   2. 请求体硬限 256KB（§10.4 单包上限，与服务端 decode 限长双保险）；
+#   3. 日志不记 query string——token 绝不进 URL 的底线不能在日志里破功。
+
+{
+	# 日志只留访问方法与路径（无 query），避免凭证与业务 UUID 泄露
+	log {
+		format filter {
+			request>uri query
+			request>headers>Authorization
+			request>headers>Cookie
+		}
+	}
+	servers {
+		metrics
+	}
+}
+
+{$RELAY_DOMAIN:relay.example.com} {
+	encode zstd gzip
+
+	# 单包硬限：超限由反代直接 413，不进业务进程
+	request_body {
+		max_size 256KB
+	}
+
+	# WSS：纯路径建连 + 升级头透传（首帧 AUTH 由服务端 3s 掐线把关）
+	@ws {
+		path /ws
+	}
+	handle @ws {
+		reverse_proxy relay:8080 {
+			header_up Connection {>Connection}
+			header_up Upgrade {>Upgrade}
+			flush_interval -1
+		}
+	}
+
+	handle {
+		reverse_proxy relay:8080 {
+			# 事件流写入是短事务；超时放宽给慢客户端
+			transport http {
+				read_timeout  30s
+				write_timeout 30s
+			}
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+	}
+
+	# 健康检查探针不给外网探（避免暴露版本面）
+	@probe path /v1/healthz
+	handle @probe {
+		respond "OK" 200
+	}
+}

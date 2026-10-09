@@ -4,6 +4,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -39,6 +40,10 @@ type Deps struct {
 
 	// Phase 1.6：WSS（nil 时不挂载 /ws，便于单测只跑 REST）
 	WSS http.Handler
+
+	// Phase 1.8：健康检查探针（nil 则跳过该项）
+	HealthPG    func(ctx context.Context) error
+	HealthRedis func(ctx context.Context) error
 }
 
 func NewRouter(d Deps) http.Handler {
@@ -49,7 +54,30 @@ func NewRouter(d Deps) http.Handler {
 	}
 
 	mux.HandleFunc("GET /v1/healthz", func(w http.ResponseWriter, r *http.Request) {
-		apierr.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "ts": time.Now().Unix()})
+		// 真探针：PG/Redis 任一不可达即 503（探针不给外网探，见 deploy/Caddyfile）
+		checks := map[string]any{}
+		ok := true
+		if d.HealthPG != nil {
+			if err := d.HealthPG(r.Context()); err != nil {
+				ok = false
+				checks["pg"] = "down"
+			} else {
+				checks["pg"] = "up"
+			}
+		}
+		if d.HealthRedis != nil {
+			if err := d.HealthRedis(r.Context()); err != nil {
+				ok = false
+				checks["redis"] = "down"
+			} else {
+				checks["redis"] = "up"
+			}
+		}
+		status := http.StatusOK
+		if !ok {
+			status = http.StatusServiceUnavailable
+		}
+		apierr.WriteJSON(w, status, map[string]any{"ok": ok, "ts": time.Now().Unix(), "checks": checks})
 	})
 
 	mux.Handle("POST /v1/auth/challenge", d.Idem.Wrap(http.HandlerFunc(d.handleChallenge)))

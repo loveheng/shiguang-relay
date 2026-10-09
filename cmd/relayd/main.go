@@ -69,6 +69,9 @@ func main() {
 		Bundles:     store.BundlesStore{Pool: pool},
 		Broadcaster: hub,
 		WSS:         hub,
+
+		HealthPG:    func(ctx context.Context) error { return pool.Ping(ctx) },
+		HealthRedis: func(ctx context.Context) error { return rdb.Ping(ctx).Err() },
 	}
 
 	srv := &http.Server{

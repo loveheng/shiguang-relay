@@ -59,7 +59,7 @@ export PATH="$HOME/sdk/go1.23.6/bin:$HOME/sdk/protoc/bin:$HOME/go/bin:$HOME/.pub
 - **Phase 1.4 协同动作：已完成**——`POST /v1/schedule/action`：`PROPOSE` 建包（准入严管=发起人与每个被邀请人双向 accepted + 成员 ≤16 + 活跃包 ≤20，单事务落 bundles/skeletons/成员信封/seq:1 事件）；其他动作走**成员 ACL**（包内放行，不要求 B↔C 互为好友）+ `UPDATE bundles ... RETURNING max_seq_id` **行锁取号**（§5.1，杜绝 MAX+1 同号冲突）+ 单事务落流水；事实三动作（`ATTACH_FACT`/`UPDATE_FACT`/`DETACH_FACT`）**绕过 `base_revision` 乐观锁**只取 seq；`FORCE_FINALIZE` 落槌 CONFIRMED，敲定后一切动作 409；广播接口 `Broadcaster` 已立，1.6 换 WSS Hub（当前 Noop）。
 - **Phase 1.5 发现与同步：已完成**——换机冷启动链路全通：`GET /v1/bundles/participating?status=active`（参与中包 + `max_seq_id` + `last_acked_seq`）→ `GET /v1/schedule/sync?bundle_id=&since_seq=&limit=`（增量补拉/跳号补洞，成员 ACL + 单页 ≤500）→ `GET /v1/bundles/{id}/key-envelopes`（**只回本成员**信封）+ `POST/GET /v1/vault/envelopes`（MSK 封送的 K_bundle 增量信封，Append-Only 同版本幂等，绝不 LWW 覆盖）；瞬时信令 `POST /v1/relay/msg`（**双向好友 ACL**）→ `GET /v1/relay/pending` → `POST /v1/relay/ack`（先置 acked 再物理 DELETE，阅后即焚）。
 - **Phase 1.6 WSS Hub：已完成**——`GET /ws` **纯路径建连**（token 绝不进 URL，防反代 Access Log 泄露凭证）→ **首帧必须是 `{"action":"AUTH","token":...}`，3s 内未完成即掐线**（非法 token 立即关闭）→ 其后一律 **protobuf 二进制帧**（`ServerFrame`/`ClientFrame`，复用冻结契约而非另立编码约定）；`CLIENT_ACK` 落 `bundle_member_cursors`（`GREATEST` 单调推进）；`Hub` 已接替 `NoopBroadcaster` 成为事件广播器——在线成员直推、离线成员交 `WakePusher`（接口已立，1.7 实装 FCM/APNs）。
-- **未开工**：1.7 部署、1.8 网关硬约束（256KB 已随 decode 生效；TTL 清理 cron / 错误码字典补全待做）。
+- **Phase 1.7 部署 + 1.8 网关收尾：已完成**——`deploy/Caddyfile`（WSS Upgrade 透传 / 256KB 硬限 / 日志过滤 query 与 Authorization / healthz 由反代应答）、`docker-compose.prod.yml`（PG 卷持久化 + Redis + relay + Caddy + **每小时 `pg_dump|gzip` 备份 sidecar**）、`scripts/backup.sh`、`scripts/ops-cleanup.sh`（TTL 清理 + 磁盘水位告警）、`.env.example`；`/v1/healthz` 升级为**真探针**（PG/Redis 任一不可达 503）；错误码字典已入 README。**Phase 1 服务端最小闭环（1.1–1.8）全通**，下一步 Phase 2 才碰拾光主仓。
 
 ## 鉴权与重放防护（契约定稿摘要，Phase 0.5）
 
@@ -77,6 +77,58 @@ export PATH="$HOME/sdk/go1.23.6/bin:$HOME/sdk/protoc/bin:$HOME/go/bin:$HOME/.pub
 4. **好友 Ticket 制**：`POST /v1/friends/invite {ticket, encrypted_intro}` 替代 `{to_user}`，防全库遍历撞库；`encrypted_intro` 为 A 用 Ticket 内 B 的 X25519 加密公钥（`enc_key_pub`=signed_prekey_pub）做 ECIES 加密的自报家门（解纯 UUID 审批死锁，pending 期落盘、`GET /v1/friends` 回包携带）。
 5. **双 Token + 重放防护**：见上节；`client_msg_id` + 时间戳 Redis `SETEX 300` 去重。
 6. **网关硬约束**：单包 Payload **≤256KB**；P2P 瞬时信令 `relay_messages` **TTL 即焚** + 后台清理 cron。
+
+## 部署（Phase 1.7）
+
+```bash
+cp .env.example .env                 # 至少设置 RELAY_JWT_SECRET（≥32 字节）与 RELAY_DOMAIN
+podman-compose -f docker-compose.prod.yml up -d
+```
+
+- `deploy/Caddyfile`：TLS 自动签发；`/ws` 放行 Upgrade 头（否则 WSS 握手被反代吃掉）；请求体硬限 256KB；**日志过滤 query 与 Authorization**（token 绝不进 URL 的底线不能在日志里破功）；`/v1/healthz` 由反代直接应答，不透传。
+- `docker-compose.prod.yml`：`postgres`（卷持久化 + 健康门）/`redis`/`relay`/`caddy` + **`backup` sidecar**（每小时 `pg_dump | gzip`，保留 7 天，配 `RCLONE_REMOTE` 即异地同步）——守住「单机 VPS 炸了 10 分钟内拉起新主机一键还原」底线。
+- 灾备手工触发：`podman-compose -f docker-compose.prod.yml exec -T backup /backup.sh`。
+
+## 运维收尾（Phase 1.8）
+
+```bash
+# 建议宿主 cron：*/30 * * * * .../scripts/ops-cleanup.sh
+COMPOSE="podman-compose -f docker-compose.prod.yml" bash scripts/ops-cleanup.sh
+```
+
+- 瞬时信令 TTL 清理（`status='acked'` 或 `expires_at < now()` 即物理删除）；
+- 磁盘水位告警（默认 ≥85% 退出码 1，接监控系统即可告警）；
+- `/v1/healthz` 为**真探针**：PG/Redis 任一不可达即 503（不返回任何内部细节）。
+
+## 错误码字典（§10.4，统一响应体）
+
+```json
+{ "error_code": "STALE_REVISION", "message": "base revision conflict", "detail": { } }
+```
+
+| error_code | HTTP | 场景 |
+|---|---|---|
+| `INVALID_REQUEST` | 400 | 请求体畸形 / 缺 `X-Client-Msg-Id` / 时间戳超窗 |
+| `UNAUTHORIZED` | 401 | 无或无效的 access_token（不细分原因，避免反馈面） |
+| `CHALLENGE_INVALID` | 401 | nonce 未知/过期/已用 |
+| `POP_SIGNATURE_INVALID` | 401 | 所有权证明签名不匹配（含公钥置换攻击） |
+| `POW_SOLUTION_INVALID` | 401 | Hashcash 解错误 |
+| `TICKET_EXPIRED` / `TICKET_SIGNATURE_INVALID` | 400 / 401 | 好友名片失效 / 被篡改 |
+| `TICKET_NONCE_USED` / `TICKET_SUBJECT_INVALID` | 400 / 403 | 名片 nonce 重放 / 扫码者非指定人 |
+| `RECIPIENT_NOT_FRIEND` / `RELATION_TERMINATED` | 403 | 非双向好友直投 / 关系已终止 |
+| `NOT_PARTICIPANT` / `NOT_INITIATOR` | 403 | 非方案包成员 / 非发起人操作专属动作 |
+| `BUNDLE_NOT_FOUND` / `USER_NOT_FOUND` / `INVITE_NOT_FOUND` | 404 | 资源不存在 |
+| `USER_ALREADY_EXISTS` / `RELATION_EXISTS` | 409 | 重复注册 / 关系已存在 |
+| `BUNDLE_CONFIRMED_IMMUTABLE` | 409 | 方案包已敲定/取消/过期 |
+| `STALE_REVISION` | 409 | 因果冲突（事实三动作豁免） |
+| `EXCEED_MAX_MEMBERS` / `EXCEED_ACTIVE_BUNDLES` / `EVENT_QUOTA_EXCEEDED` / `EXCEED_PENDING_INVITES` | 400 | 防爆仓配额族 |
+| `PREKEY_COUNT_INVALID` | 400 | OPK 数量越界（首批 10~20 / 补仓 ≤50） |
+| `RATE_LIMITED` | 429 | 注册或邀请限流 |
+| `ATTACHMENT_OVERSIZE` | 413 | 单包超 256KB |
+| `UNKNOWN_ACTION` | 400 | 未登记的 action_type |
+| `INTERNAL_ERROR` | 500 | 服务端内部错误（细节只进日志） |
+
+> 零明文红线：`message` 恒为服务端固定英文串，`detail` 只放 UUID/seq 等结构值——错误通道同样过零知识审计。
 
 ## 契约版本
 
