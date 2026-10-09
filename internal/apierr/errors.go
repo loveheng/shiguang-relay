@@ -1,0 +1,42 @@
+// Package apierr：统一错误响应体（协同设计 §10.4）。
+// 铁律：message 恒为服务端固定英文串，detail 只放 UUID/seq 等结构值——错误通道同样过零知识审计。
+package apierr
+
+import (
+	"encoding/json"
+	"net/http"
+)
+
+// 错误码（§10.4 字典族；本文件只增 Phase 1 在用的码，后续 Phase 补齐时统一在此登记）
+const (
+	InvalidRequest       = "INVALID_REQUEST"
+	Unauthorized         = "UNAUTHORIZED"
+	ChallengeInvalid     = "CHALLENGE_INVALID"
+	PopSignatureInvalid  = "POP_SIGNATURE_INVALID"
+	PowSolutionInvalid   = "POW_SOLUTION_INVALID"
+	PayloadOversize      = "ATTACHMENT_OVERSIZE"
+	MethodNotAllowed     = "METHOD_NOT_ALLOWED"
+	NotImplemented       = "NOT_IMPLEMENTED"
+	Internal             = "INTERNAL_ERROR"
+)
+
+// Body：统一响应体。
+type Body struct {
+	ErrorCode string         `json:"error_code"`
+	Message   string         `json:"message"`
+	Detail    map[string]any `json:"detail,omitempty"`
+}
+
+// Write：以给定状态码写出统一错误体。
+func Write(w http.ResponseWriter, status int, code, message string, detail map[string]any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(Body{ErrorCode: code, Message: message, Detail: detail})
+}
+
+// WriteJSON：写出正常 JSON 响应体。
+func WriteJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}

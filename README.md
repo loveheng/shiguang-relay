@@ -26,8 +26,22 @@ bash scripts/setup-toolchain.sh
 # 2) 生成双端契约代码
 bash scripts/gen-proto.sh
 
-# 3) 起 PG/Redis 并验收 DDL + seq 唯一约束（Phase 0 退出条件）
-bash scripts/verify-phase0.sh
+# 3) 起 PG/Redis（podman-compose）并验收 DDL + seq 唯一约束（Phase 0 退出条件）
+bash scripts/verify-phase0.sh          # 默认 podman-compose；要用 docker compose：COMPOSE="docker compose" bash scripts/verify-phase0.sh
+
+# 4) Phase 1 冒烟：真 PG/Redis + 真 relayd 进程，验鉴权闭环与幂等去重
+bash scripts/smoke-phase1.sh
+
+# 5) 单测（miniredis，无需真 Redis）
+go test ./...
+```
+
+日常起停（本机 podman-compose）：
+
+```bash
+podman-compose up -d                   # PG + Redis
+podman-compose --profile app up -d     # 含 relay 服务（Phase 1 起）
+podman-compose down
 ```
 
 常用 PATH（可写进 `~/.bashrc`）：
@@ -35,6 +49,12 @@ bash scripts/verify-phase0.sh
 ```bash
 export PATH="$HOME/sdk/go1.23.6/bin:$HOME/sdk/protoc/bin:$HOME/go/bin:$HOME/.pub-cache/bin:$PATH"
 ```
+
+## 当前进度
+
+- **Phase 0 契约冻结：已完成**（tag `v0.1.6-contract`，零 Go 业务代码）。
+- **Phase 1.1 鉴权闭环：已完成**——`POST /v1/auth/challenge` / `login` / `refresh` + Bearer 鉴权（401）+ `client_msg_id` 幂等去重（300s 窗口内重放原样回放）。REST 侧两个外层头：`X-Client-Msg-Id`、`X-Client-Ts`（WSS 侧走 proto `ClientFrame.client_msg_id/client_ts`，同语义）。
+- **未开工**：1.2 注册/PoP/OPK 原子弹出与补仓、1.3 好友 Ticket 建联、1.4 `schedule/action` 行锁取号落库与广播、1.5 participating/sync/vault/relay pending-ack、1.6 WSS hub、1.7 部署、1.8 网关硬约束（256KB/TTL/配额/错误码）。
 
 ## 鉴权与重放防护（契约定稿摘要，Phase 0.5）
 

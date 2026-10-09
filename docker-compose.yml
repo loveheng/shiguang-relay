@@ -1,6 +1,8 @@
 # shiguang-relay · 本地联调底座
-# Phase 0 验收线：`docker compose up -d` 起 PG + Redis（relay 服务本身在 profiles=app，
-# Phase 1 落地 cmd/relayd 后 `docker compose --profile app up -d` 起全栈）。
+# 本机用 podman-compose（docker-compose v1 协议）：
+#   podman-compose up -d               起 PG + Redis
+#   podman-compose --profile app up -d 起全栈（Phase 1 落地 cmd/relayd 后）
+# 若换 docker compose：COMPOSE="docker compose" 传给 scripts/*.sh 即可。
 services:
   postgres:
     image: postgres:16-alpine
