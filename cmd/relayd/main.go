@@ -16,6 +16,7 @@ import (
 	"shiguang-relay/internal/config"
 	"shiguang-relay/internal/httpapi"
 	"shiguang-relay/internal/store"
+	"shiguang-relay/internal/wss"
 )
 
 func main() {
@@ -45,8 +46,14 @@ func main() {
 	}
 	defer rdb.Close()
 
+	// WSS Hub 同时充当事件广播器（在线直推 / 离线交给 WakePusher）
+	hub := wss.NewHub(auth.NewIssuer(cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL),
+		store.BundlesStore{Pool: pool}, wss.NoopWakePusher{}) // Phase 1.7 换 FCM/APNs Worker 池
+
+	issuer := auth.NewIssuer(cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL)
+
 	deps := httpapi.Deps{
-		Issuer:      auth.NewIssuer(cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL),
+		Issuer:      issuer,
 		Challenges:  auth.NewChallengeStore(rdb, cfg.ChallengeTTL, cfg.PoWDifficulty),
 		Idem:        auth.NewIdempotency(rdb, cfg.IdempotentTTL, cfg.IdempotentTTL),
 		Identities:  store.PGIdentity{Pool: pool},
@@ -60,7 +67,8 @@ func main() {
 		FriendInviteLimitPerMin: cfg.FriendInviteLimitPerMin,
 
 		Bundles:     store.BundlesStore{Pool: pool},
-		Broadcaster: httpapi.NoopBroadcaster{}, // Phase 1.6 换 WSS Hub
+		Broadcaster: hub,
+		WSS:         hub,
 	}
 
 	srv := &http.Server{

@@ -76,6 +76,36 @@ func (s BundlesStore) IsParticipant(ctx context.Context, bundleID, userID string
 	return ok, nil
 }
 
+// Participants：取方案包成员清单（广播寻址用）。
+func (s BundlesStore) Participants(ctx context.Context, bundleID string) ([]string, error) {
+	var ids []string
+	if err := s.Pool.QueryRow(ctx,
+		`SELECT participant_uids FROM bundles WHERE bundle_id = $1`, bundleID).Scan(&ids); err != nil {
+		if isNoRows(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("查询成员失败: %w", err)
+	}
+	return ids, nil
+}
+
+// UpsertCursor：CLIENT_ACK 落游标——服务端据此判定谁漏了事件（只对落后者 Wake Push）。
+func (s BundlesStore) UpsertCursor(ctx context.Context, bundleID, userID string, seq int64) error {
+	if seq <= 0 {
+		return nil
+	}
+	_, err := s.Pool.Exec(ctx, `
+		INSERT INTO bundle_member_cursors (bundle_id, user_id, last_acked_seq)
+		VALUES ($1,$2,$3)
+		ON CONFLICT (bundle_id, user_id)
+		DO UPDATE SET last_acked_seq = GREATEST(bundle_member_cursors.last_acked_seq, EXCLUDED.last_acked_seq)`,
+		bundleID, userID, seq)
+	if err != nil {
+		return fmt.Errorf("更新游标失败: %w", err)
+	}
+	return nil
+}
+
 // EventsSince：增量事件（跳号补拉：since_seq=0 即全量重放）。
 func (s BundlesStore) EventsSince(ctx context.Context, bundleID string, sinceSeq int64, limit int) ([]Event, error) {
 	if limit <= 0 {

@@ -36,10 +36,18 @@ type Deps struct {
 	// Phase 1.4：协同动作（行锁取号 + 单事务落库）
 	Bundles     store.BundlesStore
 	Broadcaster Broadcaster // Phase 1.6 换成 WSS Hub
+
+	// Phase 1.6：WSS（nil 时不挂载 /ws，便于单测只跑 REST）
+	WSS http.Handler
 }
 
 func NewRouter(d Deps) http.Handler {
 	mux := http.NewServeMux()
+	// WSS：纯路径建连（token 绝不进 URL），首帧 AUTH 3s 掐线；未注入则不挂载（单测只跑 REST）
+	if d.WSS != nil {
+		mux.Handle("GET /ws", d.WSS)
+	}
+
 	mux.HandleFunc("GET /v1/healthz", func(w http.ResponseWriter, r *http.Request) {
 		apierr.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "ts": time.Now().Unix()})
 	})

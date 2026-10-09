@@ -104,4 +104,4 @@ RELAY_TEST_PG_DSN="postgres://relay:relay@localhost:5432/relay?sslmode=disable" 
 
 echo ">> relayd 日志尾部："
 tail -3 "$ROOT/bin/relayd.log" || true
-echo "Phase 1 冒烟全通（1.1 鉴权 + 1.2 注册/OPK + 1.3 好友域 + 1.4 协同动作 + 1.5 发现与同步）"
+echo "Phase 1 冒烟全通（1.1 鉴权 + 1.2 注册/OPK + 1.3 好友域 + 1.4 协同动作 + 1.5 发现与同步 + 1.6 WSS Hub）"
