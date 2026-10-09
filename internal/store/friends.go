@@ -90,6 +90,19 @@ func (s FriendsStore) List(ctx context.Context, userID string) ([]Friendship, er
 	return out, rows.Err()
 }
 
+// IsAcceptedFriend：双向 accepted 判定（瞬时直投信令 / 建包准入严管共用）。
+func (s FriendsStore) IsAcceptedFriend(ctx context.Context, a, b string) (bool, error) {
+	var n int
+	err := s.Pool.QueryRow(ctx, `
+		SELECT count(*) FROM friendships
+		WHERE status = 'accepted'
+		  AND ((user_id_a = $1 AND user_id_b = $2) OR (user_id_a = $2 AND user_id_b = $1))`, a, b).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("好友校验失败: %w", err)
+	}
+	return n > 0, nil
+}
+
 // CountPendingInvolving：与某人相关的待审批邀请数（配额判定用）。
 func (s FriendsStore) CountPendingInvolving(ctx context.Context, userID string) (int, error) {
 	var n int

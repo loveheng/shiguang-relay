@@ -62,6 +62,24 @@ func NewRouter(d Deps) http.Handler {
 	mux.Handle("GET /v1/friends",
 		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleListFriends))))
 
+	// Phase 1.5：发现与同步（换机冷启动链路）+ 密钥信封 + 瞬时信令
+	mux.Handle("GET /v1/bundles/participating",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleListParticipating))))
+	mux.Handle("GET /v1/schedule/sync",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleSync))))
+	mux.Handle("GET /v1/bundles/{bundle_id}/key-envelopes",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleKeyEnvelopes))))
+	mux.Handle("POST /v1/vault/envelopes",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleVaultAppend))))
+	mux.Handle("GET /v1/vault/envelopes",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleVaultList))))
+	mux.Handle("POST /v1/relay/msg",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleRelaySend))))
+	mux.Handle("GET /v1/relay/pending",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleRelayPending))))
+	mux.Handle("POST /v1/relay/ack",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleRelayAck))))
+
 	// 受保护的业务路由：先 Bearer 鉴权，再幂等去重（顺序不可换——未鉴权流量不值得落缓存）
 	mux.Handle("POST /v1/schedule/action",
 		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleScheduleAction))))

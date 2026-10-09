@@ -57,7 +57,8 @@ export PATH="$HOME/sdk/go1.23.6/bin:$HOME/sdk/protoc/bin:$HOME/go/bin:$HOME/.pub
 - **Phase 1.2 注册与 PreKey 托管：已完成**——`POST /v1/users`（PoP 自签 + PoW + 单 IP 限流 3/min + OPK 首批 10~20，单事务落用户与密钥）、`GET /v1/users/{id}/prekey`（身份包 + `FOR UPDATE SKIP LOCKED` 原子弹出 1 个 OPK，空池恒 200 带 `OPK_EMPTY_WARNING`）、`POST /v1/users/me/prekeys`（鉴权后补仓 ≤50/批）。
 - **Phase 1.3 好友域：已完成**——`POST /v1/friends/invite {ticket, encrypted_intro}`（Ticket 规范化消息 Ed25519 验签 + 过期 + nonce 一次性 `SETNX` + 待审批配额 ≤50 + 关系去重 409）、`POST /v1/friends/accept {invite_id, accept}`（**仅被邀方**可处置，accept=false → blocked，intro 随即置 NULL）、`GET /v1/friends`（`encrypted_intro` 只在「我是被邀方 + 仍 pending」时回包）。Ticket 签名覆盖范围：`shiguang.relay.v1/friendship-ticket|<issuer>|<subject>|<nonce>|<expires_at>`（双端一字不能差）。
 - **Phase 1.4 协同动作：已完成**——`POST /v1/schedule/action`：`PROPOSE` 建包（准入严管=发起人与每个被邀请人双向 accepted + 成员 ≤16 + 活跃包 ≤20，单事务落 bundles/skeletons/成员信封/seq:1 事件）；其他动作走**成员 ACL**（包内放行，不要求 B↔C 互为好友）+ `UPDATE bundles ... RETURNING max_seq_id` **行锁取号**（§5.1，杜绝 MAX+1 同号冲突）+ 单事务落流水；事实三动作（`ATTACH_FACT`/`UPDATE_FACT`/`DETACH_FACT`）**绕过 `base_revision` 乐观锁**只取 seq；`FORCE_FINALIZE` 落槌 CONFIRMED，敲定后一切动作 409；广播接口 `Broadcaster` 已立，1.6 换 WSS Hub（当前 Noop）。
-- **未开工**：1.5 participating/sync/vault/relay pending-ack、1.6 WSS hub、1.7 部署、1.8 网关硬约束（256KB 已随 decode 生效；TTL 清理 cron / 错误码字典补全待做）。
+- **Phase 1.5 发现与同步：已完成**——换机冷启动链路全通：`GET /v1/bundles/participating?status=active`（参与中包 + `max_seq_id` + `last_acked_seq`）→ `GET /v1/schedule/sync?bundle_id=&since_seq=&limit=`（增量补拉/跳号补洞，成员 ACL + 单页 ≤500）→ `GET /v1/bundles/{id}/key-envelopes`（**只回本成员**信封）+ `POST/GET /v1/vault/envelopes`（MSK 封送的 K_bundle 增量信封，Append-Only 同版本幂等，绝不 LWW 覆盖）；瞬时信令 `POST /v1/relay/msg`（**双向好友 ACL**）→ `GET /v1/relay/pending` → `POST /v1/relay/ack`（先置 acked 再物理 DELETE，阅后即焚）。
+- **未开工**：1.6 WSS hub、1.7 部署、1.8 网关硬约束（256KB 已随 decode 生效；TTL 清理 cron / 错误码字典补全待做）。
 
 ## 鉴权与重放防护（契约定稿摘要，Phase 0.5）
 

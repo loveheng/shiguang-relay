@@ -36,6 +36,7 @@ const (
 	ExceedMaxMembers    = "EXCEED_MAX_MEMBERS"
 	ExceedActiveBundles = "EXCEED_ACTIVE_BUNDLES"
 	UnknownAction       = "UNKNOWN_ACTION"
+	RecipientNotFriend  = "RECIPIENT_NOT_FRIEND"
 	PayloadOversize      = "ATTACHMENT_OVERSIZE"
 	MethodNotAllowed     = "METHOD_NOT_ALLOWED"
 	NotImplemented       = "NOT_IMPLEMENTED"
