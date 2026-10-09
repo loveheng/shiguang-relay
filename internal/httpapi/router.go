@@ -12,6 +12,7 @@ import (
 
 	"shiguang-relay/internal/apierr"
 	"shiguang-relay/internal/auth"
+	"shiguang-relay/internal/store"
 )
 
 const maxBodyBytes = 256 * 1024 // §10.4 单包硬限；超限 413
@@ -22,6 +23,11 @@ type Deps struct {
 	Idem        *auth.Idempotency
 	Identities  auth.IdentityResolver
 	PoWRequired bool // PoW 开关（本地联调可关；公网部署必须开）
+
+	// Phase 1.2：注册与 PreKey 托管
+	Users               store.UserStore
+	Limiter             *auth.RateLimiter
+	RegisterLimitPerMin int
 }
 
 func NewRouter(d Deps) http.Handler {
@@ -33,6 +39,12 @@ func NewRouter(d Deps) http.Handler {
 	mux.Handle("POST /v1/auth/challenge", d.Idem.Wrap(http.HandlerFunc(d.handleChallenge)))
 	mux.Handle("POST /v1/auth/login", d.Idem.Wrap(http.HandlerFunc(d.handleLogin)))
 	mux.Handle("POST /v1/auth/refresh", d.Idem.Wrap(http.HandlerFunc(d.handleRefresh)))
+
+	// Phase 1.2：注册（PoP 自签 + PoW + IP 限流）与 PreKey 托管
+	mux.Handle("POST /v1/users", d.Idem.Wrap(http.HandlerFunc(d.handleRegister)))
+	mux.Handle("GET /v1/users/{user_id}/prekey", d.Idem.Wrap(http.HandlerFunc(d.handleGetPreKey)))
+	mux.Handle("POST /v1/users/me/prekeys",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleRefillPreKeys))))
 
 	// 受保护的业务路由：先 Bearer 鉴权，再幂等去重（顺序不可换——未鉴权流量不值得落缓存）
 	mux.Handle("POST /v1/schedule/action",

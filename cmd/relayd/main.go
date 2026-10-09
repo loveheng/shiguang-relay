@@ -51,6 +51,10 @@ func main() {
 		Idem:        auth.NewIdempotency(rdb, cfg.IdempotentTTL, cfg.IdempotentTTL),
 		Identities:  store.PGIdentity{Pool: pool},
 		PoWRequired: cfg.PoWRequired,
+
+		Users:               store.UserStore{Pool: pool},
+		Limiter:             auth.NewRateLimiter(rdb, cfg.RegisterLimitPerMin, time.Minute),
+		RegisterLimitPerMin: cfg.RegisterLimitPerMin,
 	}
 
 	srv := &http.Server{

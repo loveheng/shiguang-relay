@@ -19,6 +19,8 @@ type Config struct {
 	IdempotentTTL time.Duration // client_msg_id 去重窗口（§1.4 定 300s）
 	PoWDifficulty int           // Hashcash 前导 0 位数（仅挡最低级扫描器）
 	PoWRequired   bool          // 是否强制校验 PoW（本地联调可关，公网部署必须开）
+
+	RegisterLimitPerMin int // 单 IP 每分钟注册上限（fact §7.1-2：≤3~5）
 }
 
 func env(k, def string) string {
@@ -26,6 +28,18 @@ func env(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func envInt(k string, def, lo, hi int) int {
+	raw := os.Getenv(k)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v < lo || v > hi {
+		return def
+	}
+	return v
 }
 
 func envDur(k string, def time.Duration) (time.Duration, error) {
@@ -85,5 +99,8 @@ func Load() (Config, error) {
 		PoWDifficulty: diff,
 		// 关闭开关仅用于本地联调（RELAY_POW_OFF=1）；生产默认开启。
 		PoWRequired: os.Getenv("RELAY_POW_OFF") != "1",
+
+		// 单 IP 注册限流：默认 3/min（Sybil 三防线之一）
+		RegisterLimitPerMin: envInt("RELAY_REGISTER_LIMIT_PER_MIN", 3, 1, 20),
 	}, nil
 }

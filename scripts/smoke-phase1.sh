@@ -98,6 +98,10 @@ if [[ "$BODY1" != "$BODY2" ]]; then
 fi
 echo "OK: 重放同 client_msg_id 幂等返回（响应体一致）"
 
+echo ">> 集成测试（真 PG：注册 PoP / OPK 原子弹出 / 补仓）"
+RELAY_TEST_PG_DSN="postgres://relay:relay@localhost:5432/relay?sslmode=disable" \
+  go test ./... -count=1
+
 echo ">> relayd 日志尾部："
 tail -3 "$ROOT/bin/relayd.log" || true
-echo "Phase 1.1 冒烟全通"
+echo "Phase 1 冒烟全通（1.1 鉴权闭环 + 1.2 注册与 PreKey 托管）"
