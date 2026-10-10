@@ -36,11 +36,66 @@ func dial(t *testing.T, url string) *websocket.Conn {
 
 func authJSON(t *testing.T, iss *auth.Issuer, userID string) string {
 	t.Helper()
-	pair, err := iss.Issue(userID)
+	pair, err := iss.Issue(context.Background(), userID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return fmt.Sprintf(`{"action":"AUTH","token":%q}`, pair.AccessToken)
+}
+
+// TestWSSAuthRejectsRevokedAndStale：撤销语义与 REST 同口径——
+// jti 已拉黑（登出）或纪元落后（改密）的 access token 首帧 AUTH 即被拒。
+func TestWSSAuthRejectsRevokedAndStale(t *testing.T) {
+	deps, _ := pgDeps(t)
+	hub := wss.NewHub(deps.Issuer, deps.Bundles, wss.NoopWakePusher{})
+	deps.Broadcaster = hub
+	deps.WSS = hub
+	srv := httptest.NewServer(httpapi.NewRouter(deps))
+	defer srv.Close()
+
+	a := registerUser(t, srv, store.MinInitialPreKeys)
+	ctx := context.Background()
+
+	// 场景 1：jti 拉黑（等价登出）→ AUTH 拒入
+	pair1, err := deps.Issuer.Issue(ctx, a.userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims1, err := deps.Issuer.VerifyClaims(pair1.AccessToken, "access")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deps.Deny.Add(ctx, claims1.JTI, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	assertWSSAuthRejected(t, srv, pair1.AccessToken)
+
+	// 场景 2：纪元落后（等价改密踢会话）→ AUTH 拒入。
+	// pair2 在 Bump 前签发（ver=0、干净 jti）——Bump 后被拒只能来自纪元检查，与黑名单隔离。
+	pair2, err := deps.Issuer.Issue(ctx, a.userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deps.Epochs.Bump(ctx, a.userID); err != nil {
+		t.Fatal(err)
+	}
+	assertWSSAuthRejected(t, srv, pair2.AccessToken)
+}
+
+// assertWSSAuthRejected：发送 AUTH 后服务端应发 Close 帧并断开（读出错即视为拒入）。
+func assertWSSAuthRejected(t *testing.T, srv *httptest.Server, token string) {
+	t.Helper()
+	c := dial(t, wsURL(t, srv))
+	defer c.Close()
+	_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := c.WriteMessage(websocket.TextMessage,
+		[]byte(fmt.Sprintf(`{"action":"AUTH","token":%q}`, token))); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, _, err := c.ReadMessage(); err == nil {
+		t.Fatal("被撤销/过期的 token 不应完成 WSS AUTH")
+	}
 }
 
 func TestWSSAuthAndBroadcast(t *testing.T) {
@@ -56,7 +111,7 @@ func TestWSSAuthAndBroadcast(t *testing.T) {
 	a := registerUser(t, srv, store.MinInitialPreKeys)
 	b := registerUser(t, srv, store.MinInitialPreKeys)
 	makeFriends(t, srv, a, b)
-	tokenA := login(t, srv, a.priv, a.userID)
+	tokenA := login(t, srv, a.username, a.password)
 
 	res := proposeBundle(t, srv, tokenA, []string{b.userID}, base64.StdEncoding.EncodeToString([]byte("c")))
 	bundleID, _ := res["bundle_id"].(string)
@@ -109,7 +164,7 @@ func TestWSSClientAckUpdatesCursor(t *testing.T) {
 	a := registerUser(t, srv, store.MinInitialPreKeys)
 	b := registerUser(t, srv, store.MinInitialPreKeys)
 	makeFriends(t, srv, a, b)
-	tokenA := login(t, srv, a.priv, a.userID)
+	tokenA := login(t, srv, a.username, a.password)
 	res := proposeBundle(t, srv, tokenA, []string{b.userID}, base64.StdEncoding.EncodeToString([]byte("c")))
 	bundleID, _ := res["bundle_id"].(string)
 

@@ -16,7 +16,16 @@ const (
 	PowSolutionInvalid   = "POW_SOLUTION_INVALID"
 	UserAlreadyExists    = "USER_ALREADY_EXISTS"
 	UserNotFound         = "USER_NOT_FOUND"
+	UsernameRequired     = "USERNAME_REQUIRED"
+	UsernameInvalid      = "USERNAME_INVALID"
+	UsernameExists       = "USERNAME_EXISTS"
+	PasswordTooWeak      = "PASSWORD_TOO_WEAK"
+	UserOrPasswordInvalid = "USER_OR_PASSWORD_INVALID"
+	PasswordMismatch     = "PASSWORD_MISMATCH"
 	RateLimited          = "RATE_LIMITED"
+	LoginThrottled       = "LOGIN_THROTTLED"
+	TokenStale           = "TOKEN_STALE"    // 改密后旧会话（纪元落后）
+	TokenRevoked         = "TOKEN_REVOKED"  // jti 已拉黑（rotation 重用 / 登出）
 	PreKeyCountInvalid   = "PREKEY_COUNT_INVALID"
 	// 好友域（§10.4 字典族 + §1.6）
 	TicketExpired        = "TICKET_EXPIRED"
@@ -24,6 +33,7 @@ const (
 	TicketNonceUsed      = "TICKET_NONCE_USED"
 	TicketSubjectInvalid = "TICKET_SUBJECT_INVALID"
 	ExceedPendingInvites = "EXCEED_PENDING_INVITES"
+	ExceedBlockedList    = "EXCEED_BLOCKED_LIST"
 	RelationExists       = "RELATION_EXISTS"
 	InviteNotFound       = "INVITE_NOT_FOUND"
 	// 协同动作（§10.4 字典族）

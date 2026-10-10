@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 
 	"shiguang-relay/internal/apierr"
 	"shiguang-relay/internal/auth"
@@ -26,17 +27,41 @@ type preKeyReq struct {
 }
 
 type registerReq struct {
-	UserID           string      `json:"user_id"`
-	IdentityKeyPub   string      `json:"identity_key_pub"`
-	SignedPrekeyPub  string      `json:"signed_prekey_pub"`
-	SignedPrekeySig  string      `json:"signed_prekey_sig"`
-	PushToken        string      `json:"push_token"`
-	EncryptedProfile string      `json:"encrypted_profile"`
-	RecoveryVault    string      `json:"recovery_vault"`
-	Nonce            string      `json:"nonce"`
-	SignedPop        string      `json:"signed_pop"`
-	PowSolution      string      `json:"pow_solution"`
-	OneTimePreKeys   []preKeyReq `json:"one_time_prekeys"`
+	Username          string      `json:"username"`
+	Password          string      `json:"password"`
+	IdentityKeyPub    string      `json:"identity_key_pub"`
+	SignedPrekeyPub   string      `json:"signed_prekey_pub"`
+	SignedPrekeySig   string      `json:"signed_prekey_sig"`
+	PushToken         string      `json:"push_token"`
+	EncryptedProfile  string      `json:"encrypted_profile"`
+	RecoveryVault     string      `json:"recovery_vault"`
+	Nonce             string      `json:"nonce"`
+	PowSolution       string      `json:"pow_solution"`
+	OneTimePreKeys    []preKeyReq `json:"one_time_prekeys"`
+}
+
+// 用户名/密码策略（账号体系，与 E2EE 密钥解耦）：
+//   - username：小写字母/数字/下划线，3~32；DB 唯一约束兜底
+//   - password：明文仅走 TLS 传输，服务端零落库；最小长度 8
+const (
+	minUsernameLen = 3
+	maxUsernameLen = 32
+	minPasswordLen = 8
+)
+
+// validUsername：仅校验字符集与长度（大小写已在外层归一为小写）。
+func validUsername(s string) bool {
+	n := len(s)
+	if n < minUsernameLen || n > maxUsernameLen {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 type refillReq struct {
@@ -61,8 +86,27 @@ func (d Deps) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1) nonce：一次性消费（Challenge-Response）
-	userID, pow, ok, err := d.Challenges.Consume(r.Context(), req.Nonce)
+	// 1) 用户名/密码（账号体系，与 E2EE 密钥解耦）：归一小写 + 合法性 + 哈希（服务端零明文）
+	username := strings.ToLower(strings.TrimSpace(req.Username))
+	if !validUsername(username) {
+		apierr.Write(w, http.StatusBadRequest, apierr.UsernameInvalid,
+			"username must be 3-32 chars of lowercase letters/digits/underscore", nil)
+		return
+	}
+	if len(req.Password) < minPasswordLen {
+		apierr.Write(w, http.StatusBadRequest, apierr.PasswordTooWeak,
+			"password too weak", map[string]any{"min_len": minPasswordLen})
+		return
+	}
+	pwHash, err := auth.HashPassword(req.Password)
+	if err != nil {
+		slog.Error("密码哈希失败", "err", err)
+		apierr.Write(w, http.StatusInternalServerError, apierr.Internal, "failed to hash password", nil)
+		return
+	}
+
+	// 2) nonce：一次性消费（Challenge-Response，绑定 PoW 题面）
+	_, pow, ok, err := d.Challenges.Consume(r.Context(), req.Nonce)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.Internal, "challenge store failure", nil)
 		return
@@ -71,33 +115,19 @@ func (d Deps) handleRegister(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusUnauthorized, apierr.ChallengeInvalid, "unknown or expired nonce", nil)
 		return
 	}
-	if !auth.EqualID(userID, req.UserID) {
-		apierr.Write(w, http.StatusUnauthorized, apierr.ChallengeInvalid, "nonce bound to another user", nil)
-		return
-	}
 
-	// 2) PoW
+	// 3) PoW（仅挡最低级扫描；真防线=用户名唯一 + 单 IP 限流 + OPK 瘦身）
 	if d.PoWRequired && !auth.VerifyPoW(pow, req.PowSolution, d.Challenges.Difficulty()) {
 		apierr.Write(w, http.StatusUnauthorized, apierr.PowSolutionInvalid, "proof of work solution invalid", nil)
 		return
 	}
 
-	// 3) PoP 自签：公钥取自请求体，验签通过即证明请求方持有对应私钥
+	// 4) E2EE 公钥材料（对用户透明，服务端纯盲存公钥）
 	identityPub, err := base64.StdEncoding.DecodeString(req.IdentityKeyPub)
 	if err != nil {
 		apierr.Write(w, http.StatusBadRequest, apierr.InvalidRequest, "identity_key_pub must be base64", nil)
 		return
 	}
-	sig, err := base64.StdEncoding.DecodeString(req.SignedPop)
-	if err != nil {
-		apierr.Write(w, http.StatusBadRequest, apierr.InvalidRequest, "signed_pop must be base64", nil)
-		return
-	}
-	if !auth.VerifyPoP(identityPub, sig, req.Nonce) {
-		apierr.Write(w, http.StatusUnauthorized, apierr.PopSignatureInvalid, "proof of possession signature invalid", nil)
-		return
-	}
-
 	spkPub, err := base64.StdEncoding.DecodeString(req.SignedPrekeyPub)
 	if err != nil {
 		apierr.Write(w, http.StatusBadRequest, apierr.InvalidRequest, "signed_prekey_pub must be base64", nil)
@@ -111,7 +141,7 @@ func (d Deps) handleRegister(w http.ResponseWriter, r *http.Request) {
 	profile, _ := base64.StdEncoding.DecodeString(req.EncryptedProfile)
 	vault, _ := base64.StdEncoding.DecodeString(req.RecoveryVault)
 
-	// 4) OPK 瘦身：首批只允许 10~20
+	// 5) OPK 瘦身：首批只允许 10~20
 	if n := len(req.OneTimePreKeys); n < store.MinInitialPreKeys || n > store.MaxInitialPreKeys {
 		apierr.Write(w, http.StatusBadRequest, apierr.PreKeyCountInvalid,
 			"initial one-time prekeys out of allowed range", map[string]any{
@@ -124,9 +154,10 @@ func (d Deps) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5) 单事务落用户 + 首批 OPK
-	err = d.Users.CreateUserWithPreKeys(r.Context(), store.CreateUserInput{
-		UserID:           req.UserID,
+	// 6) 单事务落用户（服务端生成 user_id）+ 首批 OPK
+	userID, err := d.Users.CreateUserWithPreKeys(r.Context(), store.CreateUserInput{
+		Username:         username,
+		PasswordHash:     pwHash,
 		IdentityKeyPub:   identityPub,
 		SignedPrekeyPub:  spkPub,
 		SignedPrekeySig:  spkSig,
@@ -134,19 +165,24 @@ func (d Deps) handleRegister(w http.ResponseWriter, r *http.Request) {
 		EncryptedProfile: profile,
 		RecoveryVault:    vault,
 	}, keys)
+	if errors.Is(err, store.ErrUsernameExists) {
+		apierr.Write(w, http.StatusConflict, apierr.UsernameExists, "username already taken", nil)
+		return
+	}
 	if errors.Is(err, store.ErrUserExists) {
 		apierr.Write(w, http.StatusConflict, apierr.UserAlreadyExists, "user already registered", nil)
 		return
 	}
 	if err != nil {
 		// 细节只进服务端日志：错误通道零明文红线（§10.4）
-		slog.Error("创建用户失败", "err", err, "user_id", req.UserID)
+		slog.Error("创建用户失败", "err", err, "username", username)
 		apierr.Write(w, http.StatusInternalServerError, apierr.Internal, "failed to create user", nil)
 		return
 	}
 
 	apierr.WriteJSON(w, http.StatusCreated, map[string]any{
-		"user_id":   req.UserID,
+		"user_id":   userID,
+		"username":  username,
 		"opk_count": len(keys),
 	})
 }
@@ -177,6 +213,48 @@ func (d Deps) handleGetPreKey(w http.ResponseWriter, r *http.Request) {
 		resp["warning"] = "OPK_EMPTY_WARNING"
 	}
 	apierr.WriteJSON(w, http.StatusOK, resp)
+}
+
+// handleLookupUser：GET /v1/users/lookup?username= —— 用户名搜索（加好友「搜索」路径）。
+// 仅登录用户可用（降低撞库/枚举面）；返回公钥身份，不弹出 OPK（X3DH 用 OPK 由调用方走 prekey 端点单独拉）。
+func (d Deps) handleLookupUser(w http.ResponseWriter, r *http.Request) {
+	caller := auth.UserIDFromContext(r.Context())
+	if caller == "" {
+		apierr.Write(w, http.StatusUnauthorized, apierr.Unauthorized, "missing bearer access token", nil)
+		return
+	}
+	// 限流防枚举（Redis 抖动放行；限流非最后一道防线）
+	allowed, _, err := d.Limiter.Allow(r.Context(), "user_lookup", caller)
+	if err != nil {
+		allowed = true
+	}
+	if !allowed {
+		apierr.Write(w, http.StatusTooManyRequests, apierr.RateLimited,
+			"too many user lookups", map[string]any{"limit_per_min": d.FriendInviteLimitPerMin})
+		return
+	}
+	username := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("username")))
+	if !validUsername(username) {
+		apierr.Write(w, http.StatusBadRequest, apierr.UsernameInvalid,
+			"username must be 3-32 chars of lowercase letters/digits/underscore", nil)
+		return
+	}
+	p, found, err := d.Users.PublicIdentityByUsername(r.Context(), username)
+	if err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.Internal, "failed to lookup user", nil)
+		return
+	}
+	if !found {
+		apierr.Write(w, http.StatusNotFound, apierr.UserNotFound, "unknown user", nil)
+		return
+	}
+	apierr.WriteJSON(w, http.StatusOK, map[string]any{
+		"user_id":           p.UserID,
+		"username":          p.Username,
+		"identity_key_pub":  b64(p.IdentityKeyPub),
+		"signed_prekey_pub": b64(p.SignedPrekeyPub),
+		"signed_prekey_sig": b64(p.SignedPrekeySig),
+	})
 }
 
 // handleRefillPreKeys：POST /v1/users/me/prekeys —— 低存量补仓（≤50/批）。
@@ -245,10 +323,21 @@ func encodePreKeys(in []store.PreKey) []map[string]string {
 
 func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
 
-// clientIP：取对端 IP（限流分桶键）。
-// 部署在 Caddy/Nginx 后请改用 X-Forwarded-For 首段——否则所有来源共享反代 IP 会被误杀，
-// 这里保持最简实现并在 README 部署章节标注。
+// clientIP：限流分桶键（真实客户端 IP）。
+// 部署在 Nginx/Caddy + Cloudflare 后，直连对端是反代，必须取可信代理头，
+// 否则所有来源共享反代 IP（127.0.0.1 / 容器 IP）会被误杀。
+// 优先 CF-Connecting-IP（Cloudflare 边缘写入，客户端无法伪造），
+// 回退 X-Forwarded-For 首段（原始客户端），最后才用直连 IP。
 func clientIP(r *http.Request) string {
+	if ip := r.Header.Get("CF-Connecting-IP"); ip != "" {
+		return ip
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if idx := strings.IndexByte(xff, ','); idx >= 0 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr

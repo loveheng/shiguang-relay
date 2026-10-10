@@ -116,11 +116,23 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSONClose(ws, "expected AUTH frame")
 		return
 	}
-	userID, err := h.issuer.Verify(f.Token, "access")
+	// 撤销语义与 REST 中间件同口径（v0.1.7）：
+	//   1. 签名/有效期/类型 → VerifyClaims；
+	//   2. jti 黑名单（登出 / refresh rotation 拉黑）→ 拒入；
+	//   3. 改密纪元（ver 落后当前纪元）→ 拒入。
+	// Hub 与 REST 共用同一 Issuer 实例（main.go 装配期 SetDeny/SetEpoch），检查随装配自动生效；
+	// 黑名单/纪元存储故障时各自 fail-open，与全库限流口径一致。
+	claims, err := h.issuer.VerifyClaims(f.Token, "access")
 	if err != nil {
 		writeJSONClose(ws, "invalid access token")
 		return
 	}
+	if h.issuer.Revoked(r.Context(), claims.JTI) ||
+		!h.issuer.CheckEpoch(r.Context(), claims.UserID, claims.Ver) {
+		writeJSONClose(ws, "token revoked or stale")
+		return
+	}
+	userID := claims.UserID
 
 	c := &conn{ws: ws, userID: userID}
 	h.register(c)

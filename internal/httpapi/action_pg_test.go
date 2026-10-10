@@ -22,8 +22,8 @@ import (
 // makeFriends：x 扫码 y 的名片并发起邀请，y 手动接受（pending → accepted）。
 func makeFriends(t *testing.T, srv *httptest.Server, x, y regInput) {
 	t.Helper()
-	tokenX := login(t, srv, x.priv, x.userID)
-	tokenY := login(t, srv, y.priv, y.userID)
+	tokenX := login(t, srv, x.username, x.password)
+	tokenY := login(t, srv, y.username, y.password)
 
 	ticket := auth.FriendshipTicket{
 		IssuerUserID:  y.userID,
@@ -84,8 +84,8 @@ func TestScheduleActionConcurrentSeqNoConflict(t *testing.T) {
 	b := registerUser(t, srv, store.MinInitialPreKeys)
 	makeFriends(t, srv, a, b)
 
-	tokenA := login(t, srv, a.priv, a.userID)
-	tokenB := login(t, srv, b.priv, b.userID)
+	tokenA := login(t, srv, a.username, a.password)
+	tokenB := login(t, srv, b.username, b.password)
 
 	res := proposeBundle(t, srv, tokenA, []string{b.userID}, base64.StdEncoding.EncodeToString([]byte("propose-cipher")))
 	bundleID, _ := res["bundle_id"].(string)
@@ -152,8 +152,8 @@ func TestScheduleActionGuards(t *testing.T) {
 	c := registerUser(t, srv, store.MinInitialPreKeys) // 非成员
 	makeFriends(t, srv, a, b)
 
-	tokenA := login(t, srv, a.priv, a.userID)
-	tokenC := login(t, srv, c.priv, c.userID)
+	tokenA := login(t, srv, a.username, a.password)
+	tokenC := login(t, srv, c.username, c.password)
 
 	res := proposeBundle(t, srv, tokenA, []string{b.userID}, base64.StdEncoding.EncodeToString([]byte("c")))
 	bundleID, _ := res["bundle_id"].(string)
@@ -226,7 +226,7 @@ func TestProposeRejectsTooManyMembers(t *testing.T) {
 	defer srv.Close()
 
 	a := registerUser(t, srv, store.MinInitialPreKeys)
-	tokenA := login(t, srv, a.priv, a.userID)
+	tokenA := login(t, srv, a.username, a.password)
 
 	uids := make([]string, store.MaxBundleMembers) // + 发起人自己 = 超限
 	for i := range uids {
@@ -248,7 +248,7 @@ func TestProposeRequiresAcceptedFriendship(t *testing.T) {
 
 	a := registerUser(t, srv, store.MinInitialPreKeys)
 	stranger := registerUser(t, srv, store.MinInitialPreKeys) // 与 A 无好友关系
-	tokenA := login(t, srv, a.priv, a.userID)
+	tokenA := login(t, srv, a.username, a.password)
 
 	body := fmt.Sprintf(`{"action":"PROPOSE","cipher":%q,"participant_uids":[%q]}`,
 		base64.StdEncoding.EncodeToString([]byte("c")), stranger.userID)

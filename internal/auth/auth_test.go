@@ -1,6 +1,7 @@
 package auth_test
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"testing"
@@ -60,7 +61,7 @@ func TestVerifyPoW(t *testing.T) {
 
 func TestIssuerRoundTrip(t *testing.T) {
 	iss := auth.NewIssuer([]byte("test-secret-test-secret-test-secret"), time.Hour, 24*time.Hour)
-	pair, err := iss.Issue("user-1")
+	pair, err := iss.Issue(context.Background(), "user-1")
 	if err != nil {
 		t.Fatal(err)
 	}

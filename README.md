@@ -60,12 +60,16 @@ export PATH="$HOME/sdk/go1.23.6/bin:$HOME/sdk/protoc/bin:$HOME/go/bin:$HOME/.pub
 - **Phase 1.5 发现与同步：已完成**——换机冷启动链路全通：`GET /v1/bundles/participating?status=active`（参与中包 + `max_seq_id` + `last_acked_seq`）→ `GET /v1/schedule/sync?bundle_id=&since_seq=&limit=`（增量补拉/跳号补洞，成员 ACL + 单页 ≤500）→ `GET /v1/bundles/{id}/key-envelopes`（**只回本成员**信封）+ `POST/GET /v1/vault/envelopes`（MSK 封送的 K_bundle 增量信封，Append-Only 同版本幂等，绝不 LWW 覆盖）；瞬时信令 `POST /v1/relay/msg`（**双向好友 ACL**）→ `GET /v1/relay/pending` → `POST /v1/relay/ack`（先置 acked 再物理 DELETE，阅后即焚）。
 - **Phase 1.6 WSS Hub：已完成**——`GET /ws` **纯路径建连**（token 绝不进 URL，防反代 Access Log 泄露凭证）→ **首帧必须是 `{"action":"AUTH","token":...}`，3s 内未完成即掐线**（非法 token 立即关闭）→ 其后一律 **protobuf 二进制帧**（`ServerFrame`/`ClientFrame`，复用冻结契约而非另立编码约定）；`CLIENT_ACK` 落 `bundle_member_cursors`（`GREATEST` 单调推进）；`Hub` 已接替 `NoopBroadcaster` 成为事件广播器——在线成员直推、离线成员交 `WakePusher`（接口已立，1.7 实装 FCM/APNs）。
 - **Phase 1.7 部署 + 1.8 网关收尾：已完成**——`deploy/Caddyfile`（WSS Upgrade 透传 / 256KB 硬限 / 日志过滤 query 与 Authorization / healthz 由反代应答）、`docker-compose.prod.yml`（PG 卷持久化 + Redis + relay + Caddy + **每小时 `pg_dump|gzip` 备份 sidecar**）、`scripts/backup.sh`、`scripts/ops-cleanup.sh`（TTL 清理 + 磁盘水位告警）、`.env.example`；`/v1/healthz` 升级为**真探针**（PG/Redis 任一不可达 503）；错误码字典已入 README。**Phase 1 服务端最小闭环（1.1–1.8）全通**，下一步 Phase 2 才碰拾光主仓。
+- **账号体系（Plan A）：已完成**——用户名+密码注册/登录/改密（`POST /v1/users` · `POST /v1/auth/login` · `POST /v1/auth/change-password`，PBKDF2 哈希零明文）+ 用户名搜索加好友（`GET /v1/users/lookup`）+ 扫码 Ticket 双通道并存；`users` 表加 `username`(唯一)/`password_hash` 列；E2EE 密钥体系藏于其后，对用户全程透明。
 
-## 鉴权与重放防护（契约定稿摘要，Phase 0.5）
+## 鉴权与账号体系（Plan A：用户名+密码，密钥对用户透明）
 
-- **Challenge-Response**：`POST /v1/auth/challenge` 下发 `nonce` + `pow_challenge/difficulty`（Hashcash，仅挡最低级扫描；真防线=注册孤岛无害化 + 单 IP ≤3/min + OPK 瘦身）；客户端回 `signed_pop`（Ed25519 对 nonce 签名）+ `pow_solution`，服务端校验后签双 Token（access 短效 / refresh 长效，`POST /v1/auth/refresh` 续期）。
-- **注册**：开放匿名 PoP 自签（`POST /v1/users`），**无邀请制**（防冷启动死锁）、无邮箱/手机；`encrypted_profile` 端侧全密文，服务端零明文昵称。
-- **WSS 首帧 AUTH**：连接后 3s 内必须发 `ClientFrame{auth: AuthChallenge/LoginRequest}` 完成鉴权，否则掐线；后续帧按 `client_msg_id` 去重。
+- **注册**：`POST /v1/users` 携 `username`（小写字母/数字/下划线 3~32，唯一）+ `password`（≥8 位，服务端 PBKDF2-HMAC-SHA256 派生哈希，零明文落库）+ E2EE 公钥材料（身份钥/签名预钥/首批 OPK 10~20）。保留 PoW + 单 IP 限流防女巫。
+- **登录**：`POST /v1/auth/login {username, password}` 验哈希签双 Token（access 短效 / refresh 长效，`POST /v1/auth/refresh` 续期）；用户不存在与密码错误同一 401 口径（防账号枚举）。
+- **改密**：`POST /v1/auth/change-password {old_password, new_password}`（Bearer）——仅换哈希不动端侧 E2EE 密钥；换设备走 `recovery_vault` 恢复密钥。
+- **加好友双通道**：搜索 `GET /v1/users/lookup?username=`（Bearer，限流防枚举）→ `POST /v1/friends/request {to_user_id, encrypted_intro}` 直发；扫码原 `POST /v1/friends/invite {ticket, encrypted_intro}` 不变。两路同样落 pending、被邀方手动 approve，`GET /v1/friends` 回包携带对方 `username`。
+- **密钥体系对用户透明**：E2EE（Ed25519 IK + X25519 SPK + OPK）是加密引擎而非登录凭证，用户全程只见「用户名+密码」。
+- **WSS 首帧 AUTH**：连接后 3s 内必须发 `{"action":"AUTH","token":...}`，否则掐线；后续帧按 `client_msg_id` 去重。
 - **重放去重键**：`client_msg_id` + `client_ts`，服务端 Redis `SETEX 300` 幂等；同键重放返回首次结果，不入流水。
 - **网关硬约束**：单包 Payload ≤256KB；P2P 瞬时信令 `relay_messages` TTL 即焚（`status='acked'` 即物理删 + 过期清理 cron）。
 
@@ -119,6 +123,10 @@ COMPOSE="podman-compose -f docker-compose.prod.yml" bash scripts/ops-cleanup.sh
 | `NOT_PARTICIPANT` / `NOT_INITIATOR` | 403 | 非方案包成员 / 非发起人操作专属动作 |
 | `BUNDLE_NOT_FOUND` / `USER_NOT_FOUND` / `INVITE_NOT_FOUND` | 404 | 资源不存在 |
 | `USER_ALREADY_EXISTS` / `RELATION_EXISTS` | 409 | 重复注册 / 关系已存在 |
+| `USERNAME_INVALID` / `USERNAME_EXISTS` | 400 / 409 | 用户名不合法（3~32 小写字母/数字/下划线）/ 已被占用 |
+| `PASSWORD_TOO_WEAK` | 400 | 密码强度不足（<8 位） |
+| `USER_OR_PASSWORD_INVALID` | 401 | 用户名或密码错误（不区分，防账号枚举） |
+| `PASSWORD_MISMATCH` | 401 | 改密时旧密码错误 |
 | `BUNDLE_CONFIRMED_IMMUTABLE` | 409 | 方案包已敲定/取消/过期 |
 | `STALE_REVISION` | 409 | 因果冲突（事实三动作豁免） |
 | `EXCEED_MAX_MEMBERS` / `EXCEED_ACTIVE_BUNDLES` / `EVENT_QUOTA_EXCEEDED` / `EXCEED_PENDING_INVITES` | 400 | 防爆仓配额族 |

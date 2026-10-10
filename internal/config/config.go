@@ -22,6 +22,11 @@ type Config struct {
 
 	RegisterLimitPerMin int // 单 IP 每分钟注册上限（fact §7.1-2：≤3~5）
 
+	// 登录防爆破双桶：
+	LoginLimitPerMin int           // 单 IP 每分钟登录尝试上限（计数所有请求，挡扫射）
+	LoginMaxFails    int           // 单账号窗口内失败锁定阈值（仅计失败，挡定点爆破）
+	LoginLockWindow  time.Duration // 失败锁定窗口（首个失败起算，成功登录清零）
+
 	FriendInviteLimitPerMin int // 单用户每分钟好友邀请上限（防撞库骚扰）
 }
 
@@ -74,6 +79,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	loginLockWindow, err := envDur("RELAY_LOGIN_LOCK_WINDOW_SEC", 15*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
 
 	secret := os.Getenv("RELAY_JWT_SECRET")
 	if len(secret) < 32 {
@@ -107,5 +116,10 @@ func Load() (Config, error) {
 
 		// 好友邀请限流：默认 10/min（Ticket 制已防撞库，此为第二层）
 		FriendInviteLimitPerMin: envInt("RELAY_FRIEND_INVITE_LIMIT_PER_MIN", 10, 1, 60),
+
+		// 登录防爆破：IP 桶默认 10/min；账号桶默认 5 次失败锁 15 分钟
+		LoginLimitPerMin: envInt("RELAY_LOGIN_LIMIT_PER_MIN", 10, 1, 120),
+		LoginMaxFails:    envInt("RELAY_LOGIN_MAX_FAILS", 5, 3, 20),
+		LoginLockWindow:  loginLockWindow,
 	}, nil
 }

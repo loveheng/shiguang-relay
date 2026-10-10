@@ -1,10 +1,14 @@
-# shiguang-relay 生产档（Phase 1.7）
+# shiguang-relay 生产档（Phase 1.7，nginx + Cloudflare 橙云版）
 # 用法：
-#   cp .env.example .env   # 至少设置 RELAY_JWT_SECRET（≥32 字节）与 RELAY_DOMAIN
-#   COMPOSE="podman-compose -f docker-compose.prod.yml" bash scripts/smoke-phase1.sh 之外，
+#   cp .env.example .env   # 至少设置 RELAY_JWT_SECRET（≥32 字节）与 PG_PASSWORD
 #   生产起服：podman-compose -f docker-compose.prod.yml up -d
 #
-# 底线（fact §7.1-3）：单机 VPS 炸了要能 10 分钟内拉起新主机一键还原 —— 备份 sidecar 不可省。
+# TLS 由 Cloudflare 橙云（代理）在边缘终结并签发证书；源站只跑一个 nginx 做
+# HTTP 反代到 relay:8080（见 deploy/nginx.conf）。因此本 compose 不再含 Caddy，
+# relay 只对本机回环暴露（127.0.0.1:8080），外部不可直连。
+#
+# 底线（fact §7.1-3）：单机 VPS 炸了要能 10 分钟内拉起新主机一键还原 —— 备份 sidecar
+# 稳定后建议启用（见下方 backup 服务，默认关闭，--profile backup 启用）。
 
 services:
   postgres:
@@ -32,12 +36,15 @@ services:
     # 只存 nonce / 幂等键 / WSS 会话态，重启即空可接受（非持久事实源）
 
   relay:
-    build: .
+    image: ${RELAY_IMAGE:-ghcr.io/loveheng/shiguang-relay:latest}
     container_name: relay-app
     restart: unless-stopped
+    # 只对本机回环暴露：外部经 Cloudflare → 源站 nginx → 127.0.0.1:8080 进入，relay 不直连外网
+    ports:
+      - "127.0.0.1:8080:8080"
     environment:
       RELAY_LISTEN: ":8080"
-      RELAY_PG_DSN: "postgres://${PG_USER:-relay}:${PG_PASSWORD}@postgres:5432/${PG_DB:-relay}?sslmode=disable"
+      RELAY_PG_DSN: "host=postgres port=5432 dbname=${PG_DB:-relay} user=${PG_USER:-relay} password='${PG_PASSWORD:?PG_PASSWORD required}' sslmode=disable"
       RELAY_REDIS_ADDR: "redis:6379"
       RELAY_JWT_SECRET: "${RELAY_JWT_SECRET:?RELAY_JWT_SECRET required (>=32 bytes)}"
       RELAY_POW_DIFFICULTY: "${RELAY_POW_DIFFICULTY:-4}"
@@ -49,25 +56,10 @@ services:
       redis:
         condition: service_started
 
-  caddy:
-    image: caddy:2-alpine
-    container_name: relay-caddy
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
-    environment:
-      RELAY_DOMAIN: "${RELAY_DOMAIN:?RELAY_DOMAIN required}"
-    volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      - relay
-
   # 灾备：每小时 pg_dump | gzip 落本地卷；配了 RCLONE_REMOTE 则同步到异地（R2/S3）
+  # 默认不启动（服务尚不稳定）；稳定后启用：compose ... --profile backup up -d
   backup:
+    profiles: ["backup"]
     image: postgres:16-alpine
     container_name: relay-backup
     restart: unless-stopped
@@ -93,6 +85,4 @@ services:
 
 volumes:
   pgdata:
-  caddy_data:
-  caddy_config:
   backups:

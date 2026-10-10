@@ -5,10 +5,10 @@ package httpapi
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"shiguang-relay/internal/apierr"
@@ -30,6 +30,22 @@ type Deps struct {
 	Limiter             *auth.RateLimiter
 	RegisterLimitPerMin int
 
+	// 账号体系（Plan A：用户名+密码仅鉴权，与 E2EE 密钥解耦）
+	Credentials CredentialVerifier // 用户名+密码校验（生产=store.UserStore；测试可注入假实现）
+
+	// 登录防爆破双桶（nil 容忍——单测可不注入，nil 时跳过对应防线）：
+	//   LoginLimiter：IP 桶，计数所有登录请求（挡扫射）；
+	//   LoginGuard：账号桶，仅计失败（挡定点爆破），成功清零。
+	LoginLimiter    *auth.RateLimiter
+	LoginGuard      *auth.LoginGuard
+	LoginLockWindow time.Duration
+
+	// Token 撤销（nil 容忍）：
+	//   Deny：jti 黑名单（refresh rotation 重用检测 / 登出）；
+	//   Epochs：用户令牌纪元（改密全量踢旧会话；Issuer 需 SetEpoch 后 ver 才非 0）。
+	Deny   *auth.DenyList
+	Epochs *auth.EpochStore
+
 	// Phase 1.3：好友域（Ticket 制建联）
 	Friends                 store.FriendsStore
 	FriendInviteLimitPerMin int
@@ -44,6 +60,12 @@ type Deps struct {
 	// Phase 1.8：健康检查探针（nil 则跳过该项）
 	HealthPG    func(ctx context.Context) error
 	HealthRedis func(ctx context.Context) error
+}
+
+// CredentialVerifier：用户名+密码校验（Plan A：密码仅鉴权，与 E2EE 密钥解耦）。
+// 生产实现走 store.UserStore.VerifyPassword（按 username 取哈希判定）；测试可注入假实现，无需真 PG。
+type CredentialVerifier interface {
+	VerifyPassword(ctx context.Context, username, password string) (userID string, ok bool, err error)
 }
 
 func NewRouter(d Deps) http.Handler {
@@ -83,20 +105,37 @@ func NewRouter(d Deps) http.Handler {
 	mux.Handle("POST /v1/auth/challenge", d.Idem.Wrap(http.HandlerFunc(d.handleChallenge)))
 	mux.Handle("POST /v1/auth/login", d.Idem.Wrap(http.HandlerFunc(d.handleLogin)))
 	mux.Handle("POST /v1/auth/refresh", d.Idem.Wrap(http.HandlerFunc(d.handleRefresh)))
+	mux.Handle("POST /v1/auth/logout",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleLogout))))
+	mux.Handle("POST /v1/auth/change-password",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleChangePassword))))
 
 	// Phase 1.2：注册（PoP 自签 + PoW + IP 限流）与 PreKey 托管
 	mux.Handle("POST /v1/users", d.Idem.Wrap(http.HandlerFunc(d.handleRegister)))
 	mux.Handle("GET /v1/users/{user_id}/prekey", d.Idem.Wrap(http.HandlerFunc(d.handleGetPreKey)))
+	mux.Handle("GET /v1/users/lookup",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleLookupUser))))
+	// 自账户：读回自身份（含 recovery_vault——换机恢复链路）与密文资料/推送令牌更新
+	mux.Handle("GET /v1/users/me",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleGetMe))))
+	mux.Handle("PATCH /v1/users/me",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleUpdateMe))))
 	mux.Handle("POST /v1/users/me/prekeys",
 		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleRefillPreKeys))))
 
-	// Phase 1.3：好友 Ticket 建联（全部要求 Bearer）
+	// Phase 1.3：好友建联（全部要求 Bearer）——扫码 Ticket 与用户名搜索双通道
 	mux.Handle("POST /v1/friends/invite",
 		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleInviteFriend))))
+	mux.Handle("POST /v1/friends/request",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleFriendRequest))))
 	mux.Handle("POST /v1/friends/accept",
 		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleAcceptFriend))))
 	mux.Handle("GET /v1/friends",
 		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleListFriends))))
+	mux.Handle("DELETE /v1/friends/{user_id}",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleRemoveFriend))))
+	mux.Handle("POST /v1/friends/{user_id}/block",
+		auth.RequireAuth(d.Issuer)(d.Idem.Wrap(http.HandlerFunc(d.handleBlockFriend))))
 
 	// Phase 1.5：发现与同步（换机冷启动链路）+ 密钥信封 + 瞬时信令
 	mux.Handle("GET /v1/bundles/participating",
@@ -132,14 +171,22 @@ type challengeReq struct {
 }
 
 type loginReq struct {
-	UserID      string `json:"user_id"`
-	Nonce       string `json:"nonce"`
-	SignedPop   string `json:"signed_pop"`   // base64(Sign(nonce) with IK)
-	PowSolution string `json:"pow_solution"`
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 type refreshReq struct {
 	RefreshToken string `json:"refresh_token"`
+}
+
+// logoutReq：登出请求体；refresh_token 可选（带上则一并撤销）。
+type logoutReq struct {
+	RefreshToken string `json:"refresh_token"`
+}
+
+type changePasswordReq struct {
+	OldPassword string `json:"old_password"`
+	NewPassword string `json:"new_password"`
 }
 
 func (d Deps) handleChallenge(w http.ResponseWriter, r *http.Request) {
@@ -147,10 +194,7 @@ func (d Deps) handleChallenge(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if req.UserID == "" {
-		apierr.Write(w, http.StatusBadRequest, apierr.InvalidRequest, "user_id required", nil)
-		return
-	}
+	// user_id 可选：注册阶段尚无 user_id（用户名体系下注册不带 user_id），登录阶段也已无需 challenge 绑定。
 	ch, err := d.Challenges.Issue(r.Context(), req.UserID)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.Internal, "failed to issue challenge", nil)
@@ -164,40 +208,60 @@ func (d Deps) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	userID, pow, ok, err := d.Challenges.Consume(r.Context(), req.Nonce)
+	if req.Username == "" || req.Password == "" {
+		apierr.Write(w, http.StatusBadRequest, apierr.InvalidRequest, "username and password required", nil)
+		return
+	}
+	// 用户名归一小写（与注册一致）。
+	username := strings.ToLower(strings.TrimSpace(req.Username))
+
+	// 防爆破双桶（与注册 Sybil 防线同哲学）：
+	//   IP 桶——计数所有请求（含成功），挡分布式扫射；
+	//   账号桶（LoginGuard）——仅计失败，挡定点爆破。
+	// Redis 抖动一律放行（限流不是最后一道防线，与 register 口径一致）。
+	if d.LoginLimiter != nil {
+		allowed, _, err := d.LoginLimiter.Allow(r.Context(), "login", clientIP(r))
+		if err != nil {
+			allowed = true
+		}
+		if !allowed {
+			apierr.Write(w, http.StatusTooManyRequests, apierr.LoginThrottled,
+				"too many login attempts", nil)
+			return
+		}
+	}
+	if d.LoginGuard != nil {
+		blocked, err := d.LoginGuard.Blocked(r.Context(), username)
+		if err != nil {
+			blocked = false
+		}
+		if blocked {
+			apierr.Write(w, http.StatusTooManyRequests, apierr.LoginThrottled,
+				"account temporarily locked after too many failed logins",
+				map[string]any{"retry_after_sec": int(d.LoginLockWindow.Seconds())})
+			return
+		}
+	}
+
+	// 按 username 校验密码哈希（Plan A：密码仅鉴权）。
+	// 用户不存在与密码错误同一响应口径，避免账号枚举侧信道。
+	userID, ok, err := d.Credentials.VerifyPassword(r.Context(), username, req.Password)
 	if err != nil {
-		apierr.Write(w, http.StatusInternalServerError, apierr.Internal, "challenge store failure", nil)
+		apierr.Write(w, http.StatusInternalServerError, apierr.Internal, "credential check failure", nil)
 		return
 	}
 	if !ok {
-		apierr.Write(w, http.StatusUnauthorized, apierr.ChallengeInvalid, "unknown or expired nonce", nil)
+		// 失败记账不阻断 401 主口径（记账失败时下次窗口自然重置）
+		if d.LoginGuard != nil {
+			_ = d.LoginGuard.RecordFail(r.Context(), username)
+		}
+		apierr.Write(w, http.StatusUnauthorized, apierr.UserOrPasswordInvalid, "invalid username or password", nil)
 		return
 	}
-	if !auth.EqualID(userID, req.UserID) {
-		apierr.Write(w, http.StatusUnauthorized, apierr.ChallengeInvalid, "nonce bound to another user", nil)
-		return
+	if d.LoginGuard != nil {
+		d.LoginGuard.Reset(r.Context(), username)
 	}
-	if d.PoWRequired && !auth.VerifyPoW(pow, req.PowSolution, d.Challenges.Difficulty()) {
-		apierr.Write(w, http.StatusUnauthorized, apierr.PowSolutionInvalid, "proof of work solution invalid", nil)
-		return
-	}
-
-	pub, err := d.Identities.IdentityKey(r.Context(), req.UserID)
-	if err != nil {
-		apierr.Write(w, http.StatusInternalServerError, apierr.Internal, "identity lookup failure", nil)
-		return
-	}
-	if len(pub) == 0 {
-		apierr.Write(w, http.StatusUnauthorized, apierr.Unauthorized, "unknown user", nil)
-		return
-	}
-	sig, err := base64.StdEncoding.DecodeString(req.SignedPop)
-	if err != nil || !auth.VerifyPoP(pub, sig, req.Nonce) {
-		apierr.Write(w, http.StatusUnauthorized, apierr.PopSignatureInvalid, "proof of possession signature invalid", nil)
-		return
-	}
-
-	pair, err := d.Issuer.Issue(req.UserID)
+	pair, err := d.Issuer.Issue(r.Context(), userID)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.Internal, "failed to issue tokens", nil)
 		return
@@ -205,22 +269,105 @@ func (d Deps) handleLogin(w http.ResponseWriter, r *http.Request) {
 	apierr.WriteJSON(w, http.StatusOK, pair)
 }
 
+// handleChangePassword：POST /v1/auth/change-password —— 改密（Plan A：仅换密码哈希，不动 E2EE 密钥）。
+func (d Deps) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	caller := auth.UserIDFromContext(r.Context())
+	if caller == "" {
+		apierr.Write(w, http.StatusUnauthorized, apierr.Unauthorized, "missing bearer access token", nil)
+		return
+	}
+	var req changePasswordReq
+	if !decode(w, r, &req) {
+		return
+	}
+	if len(req.NewPassword) < minPasswordLen {
+		apierr.Write(w, http.StatusBadRequest, apierr.PasswordTooWeak,
+			"password too weak", map[string]any{"min_len": minPasswordLen})
+		return
+	}
+	// 先校验旧密码（按 user_id，不改依赖 username）
+	ok, err := d.Users.CheckPasswordByUserID(r.Context(), caller, req.OldPassword)
+	if err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.Internal, "password check failure", nil)
+		return
+	}
+	if !ok {
+		apierr.Write(w, http.StatusUnauthorized, apierr.PasswordMismatch, "old password incorrect", nil)
+		return
+	}
+	newHash, err := auth.HashPassword(req.NewPassword)
+	if err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.Internal, "failed to hash password", nil)
+		return
+	}
+	if err := d.Users.UpdatePassword(r.Context(), caller, newHash); err != nil {
+		apierr.Write(w, http.StatusInternalServerError, apierr.Internal, "failed to update password", nil)
+		return
+	}
+	// 改密踢会话：令牌纪元 +1，该用户全部既有 access/refresh 即时失效（被盗 token 止损）
+	if d.Epochs != nil {
+		_ = d.Epochs.Bump(r.Context(), caller)
+	}
+	apierr.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
 func (d Deps) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	var req refreshReq
 	if !decode(w, r, &req) {
 		return
 	}
-	userID, err := d.Issuer.Verify(req.RefreshToken, "refresh")
+	claims, err := d.Issuer.VerifyClaims(req.RefreshToken, "refresh")
 	if err != nil {
 		apierr.Write(w, http.StatusUnauthorized, apierr.Unauthorized, "invalid or expired refresh token", nil)
 		return
 	}
-	pair, err := d.Issuer.Issue(userID)
+	// 重用检测：rotation 已换新过的 refresh（jti 在黑名单）→ 拒绝（盗号止损）
+	if d.Deny != nil && d.Deny.Has(r.Context(), claims.JTI) {
+		apierr.Write(w, http.StatusUnauthorized, apierr.TokenRevoked, "refresh token revoked", nil)
+		return
+	}
+	// 改密后旧 refresh 一并失效（纪元比对，与中间件同口径）
+	if !d.Issuer.CheckEpoch(r.Context(), claims.UserID, claims.Ver) {
+		apierr.Write(w, http.StatusUnauthorized, apierr.TokenStale, "session invalidated, please log in again", nil)
+		return
+	}
+	pair, err := d.Issuer.Issue(r.Context(), claims.UserID)
 	if err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.Internal, "failed to issue tokens", nil)
 		return
 	}
+	// rotation：旧 refresh jti 拉黑至原到期时刻——已签发新对，旧实例自此只能被识别为重放
+	if d.Deny != nil && claims.JTI != "" {
+		if ttl := time.Until(time.Unix(claims.Expiry, 0)); ttl > 0 {
+			_ = d.Deny.Add(r.Context(), claims.JTI, ttl)
+		}
+	}
 	apierr.WriteJSON(w, http.StatusOK, pair)
+}
+
+// handleLogout：POST /v1/auth/logout —— 主动登出（access + refresh 双 jti 拉黑至各自到期）。
+// 幂等：重复登出同一 token 重复拉黑无害；已过期 token 拉黑是 no-op。
+func (d Deps) handleLogout(w http.ResponseWriter, r *http.Request) {
+	claims := auth.ClaimsFromContext(r.Context())
+	if claims.UserID == "" {
+		apierr.Write(w, http.StatusUnauthorized, apierr.Unauthorized, "missing bearer access token", nil)
+		return
+	}
+	if d.Deny != nil {
+		if ttl := time.Until(time.Unix(claims.Expiry, 0)); ttl > 0 {
+			_ = d.Deny.Add(r.Context(), claims.JTI, ttl)
+		}
+		var req logoutReq
+		if decode(w, r, &req) && req.RefreshToken != "" {
+			if rc, err := d.Issuer.VerifyClaims(req.RefreshToken, "refresh"); err == nil && rc.JTI != "" {
+				if ttl := time.Until(time.Unix(rc.Expiry, 0)); ttl > 0 {
+					_ = d.Deny.Add(r.Context(), rc.JTI, ttl)
+				}
+			}
+			// 非法/过期 refresh 静默忽略——登出永远成功，不泄露 token 状态
+		}
+	}
+	apierr.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
 // decode：限长解码请求体；任何解析失败都走统一 400/413。

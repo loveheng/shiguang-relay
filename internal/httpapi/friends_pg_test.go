@@ -38,8 +38,8 @@ func TestFriendInviteAcceptFlow(t *testing.T) {
 	// A 发起扫码，B 是 Ticket 签发人（被加者）
 	a := registerUser(t, srv, 10)
 	b := registerUser(t, srv, 10)
-	tokenA := login(t, srv, a.priv, a.userID)
-	tokenB := login(t, srv, b.priv, b.userID)
+	tokenA := login(t, srv, a.username, a.password)
+	tokenB := login(t, srv, b.username, b.password)
 
 	// 未鉴权 → 401
 	ticket := auth.FriendshipTicket{
@@ -146,6 +146,96 @@ func TestFriendInviteAcceptFlow(t *testing.T) {
 	}
 }
 
+func TestFriendRequestViaUsernameSearch(t *testing.T) {
+	deps, _ := pgDeps(t)
+	srv := httptest.NewServer(httpapi.NewRouter(deps))
+	defer srv.Close()
+
+	a := registerUser(t, srv, 10)
+	b := registerUser(t, srv, 10)
+	tokenA := login(t, srv, a.username, a.password)
+	tokenB := login(t, srv, b.username, b.password)
+
+	// 未鉴权 lookup → 401
+	l0 := doJSON(t, srv, http.MethodGet, "/v1/users/lookup?username="+b.username, "", randomID("m"), "")
+	l0.Body.Close()
+	if l0.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("未鉴权 lookup 期望 401，实际 %d", l0.StatusCode)
+	}
+
+	// A 搜索 B → 200 + user_id/username 一致
+	l1 := doJSON(t, srv, http.MethodGet, "/v1/users/lookup?username="+b.username, "", randomID("m"), tokenA)
+	defer l1.Body.Close()
+	if l1.StatusCode != http.StatusOK {
+		t.Fatalf("lookup 期望 200，实际 %d: %s", l1.StatusCode, readAll(t, l1))
+	}
+	var lu struct {
+		UserID   string `json:"user_id"`
+		Username string `json:"username"`
+	}
+	_ = json.NewDecoder(l1.Body).Decode(&lu)
+	if lu.UserID != b.userID || lu.Username != b.username {
+		t.Fatalf("lookup 结果不符: %+v", lu)
+	}
+
+	// 搜索不存在用户 → 404（与存在用户同一响应通道，仅状态码区分）
+	l2 := doJSON(t, srv, http.MethodGet, "/v1/users/lookup?username="+randName("nobody"), "", randomID("m"), tokenA)
+	l2.Body.Close()
+	if l2.StatusCode != http.StatusNotFound {
+		t.Fatalf("未知用户 lookup 期望 404，实际 %d", l2.StatusCode)
+	}
+
+	// A 直发申请 → 201 pending
+	intro := base64.StdEncoding.EncodeToString([]byte("我是搜索来的张三"))
+	r1 := doJSON(t, srv, http.MethodPost, "/v1/friends/request",
+		fmt.Sprintf(`{"to_user_id":%q,"encrypted_intro":%q}`, b.userID, intro), randomID("m"), tokenA)
+	defer r1.Body.Close()
+	if r1.StatusCode != http.StatusCreated {
+		t.Fatalf("直发申请期望 201，实际 %d: %s", r1.StatusCode, readAll(t, r1))
+	}
+
+	// 重复申请 → 409 RELATION_EXISTS
+	r2 := doJSON(t, srv, http.MethodPost, "/v1/friends/request",
+		fmt.Sprintf(`{"to_user_id":%q}`, b.userID), randomID("m"), tokenA)
+	r2.Body.Close()
+	if r2.StatusCode != http.StatusConflict {
+		t.Fatalf("重复申请期望 409，实际 %d", r2.StatusCode)
+	}
+
+	// 目标不存在 → 404
+	r3 := doJSON(t, srv, http.MethodPost, "/v1/friends/request",
+		fmt.Sprintf(`{"to_user_id":%q}`, randomID("ghost")), randomID("m"), tokenA)
+	r3.Body.Close()
+	if r3.StatusCode != http.StatusNotFound {
+		t.Fatalf("目标不存在期望 404，实际 %d", r3.StatusCode)
+	}
+
+	// B 列表可见 pending + username + intro
+	lb := doJSON(t, srv, http.MethodGet, "/v1/friends", "", randomID("m"), tokenB)
+	var lbOut struct {
+		Friends []struct {
+			UserID   string `json:"user_id"`
+			Username string `json:"username"`
+			Status   string `json:"status"`
+			Intro    string `json:"encrypted_intro"`
+		} `json:"friends"`
+	}
+	_ = json.NewDecoder(lb.Body).Decode(&lbOut)
+	lb.Body.Close()
+	if len(lbOut.Friends) != 1 || lbOut.Friends[0].Status != "pending" ||
+		lbOut.Friends[0].Username != a.username || lbOut.Friends[0].UserID != a.userID || lbOut.Friends[0].Intro == "" {
+		t.Fatalf("B 侧应见 1 条 pending（对方=A）且带 username+intro，实际 %+v", lbOut.Friends)
+	}
+
+	// B 接受 → accepted（invite_id = a:b）
+	r4 := doJSON(t, srv, http.MethodPost, "/v1/friends/accept",
+		fmt.Sprintf(`{"invite_id":%q,"accept":true}`, a.userID+":"+b.userID), randomID("m"), tokenB)
+	defer r4.Body.Close()
+	if r4.StatusCode != http.StatusOK {
+		t.Fatalf("接受申请期望 200，实际 %d: %s", r4.StatusCode, readAll(t, r4))
+	}
+}
+
 func TestFriendInviteRejectsBadTickets(t *testing.T) {
 	deps, _ := pgDeps(t)
 	srv := httptest.NewServer(httpapi.NewRouter(deps))
@@ -154,7 +244,7 @@ func TestFriendInviteRejectsBadTickets(t *testing.T) {
 	a := registerUser(t, srv, 10)
 	b := registerUser(t, srv, 10)
 	c := registerUser(t, srv, 10)
-	tokenA := login(t, srv, a.priv, a.userID)
+	tokenA := login(t, srv, a.username, a.password)
 
 	// 过期票 → 400
 	expired := auth.FriendshipTicket{

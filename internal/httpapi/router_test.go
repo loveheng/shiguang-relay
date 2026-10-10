@@ -2,9 +2,6 @@ package httpapi_test
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -19,27 +16,42 @@ import (
 	"shiguang-relay/internal/httpapi"
 )
 
-type fakeIdentities struct {
-	pub ed25519.PublicKey
+// fakeIdentities：IdentityResolver 假实现（Ticket 域用；本文件测试路径不触发）。
+type fakeIdentities struct{}
+
+func (fakeIdentities) IdentityKey(_ context.Context, _ string) ([]byte, error) {
+	return []byte("fake-pub"), nil
 }
 
-func (f fakeIdentities) IdentityKey(_ context.Context, _ string) ([]byte, error) { return f.pub, nil }
+// fakeCreds：用户名+密码校验假实现（Plan A 登录无需真 PG）。
+type fakeCreds struct{ userID string }
 
-func newDeps(t *testing.T) (httpapi.Deps, ed25519.PrivateKey, string) {
+func (f fakeCreds) VerifyPassword(_ context.Context, username, password string) (string, bool, error) {
+	if username == "user-1" && password == "pass" {
+		return f.userID, true, nil
+	}
+	return "", false, nil
+}
+
+func newDeps(t *testing.T) httpapi.Deps {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
+	issuer := auth.NewIssuer([]byte("test-secret-test-secret-test-secret"), time.Hour, 24*time.Hour)
+	epochs := auth.NewEpochStore(rdb, 24*time.Hour)
+	deny := auth.NewDenyList(rdb)
+	issuer.SetEpoch(epochs)
+	issuer.SetDeny(deny)
 	return httpapi.Deps{
-		Issuer:      auth.NewIssuer([]byte("test-secret-test-secret-test-secret"), time.Hour, 24*time.Hour),
+		Issuer:      issuer,
 		Challenges:  auth.NewChallengeStore(rdb, time.Minute, 2),
 		Idem:        auth.NewIdempotency(rdb, 5*time.Minute, 5*time.Minute),
-		Identities:  fakeIdentities{pub: pub},
+		Identities:  fakeIdentities{},
+		Credentials: fakeCreds{userID: "user-1"},
 		PoWRequired: true,
-	}, priv, "user-1"
+		Deny:        deny,
+		Epochs:      epochs,
+	}
 }
 
 func doJSON(t *testing.T, srv *httptest.Server, method, path, body, msgID, token string) *http.Response {
@@ -63,40 +75,18 @@ func doJSON(t *testing.T, srv *httptest.Server, method, path, body, msgID, token
 	return resp
 }
 
-// login：走完整 Challenge-Response 拿 access_token。
-func login(t *testing.T, srv *httptest.Server, priv ed25519.PrivateKey, userID string) string {
+// login：用户名+密码登录（Plan A）拿 access_token。
+// msg_id 必须每次唯一——幂等中间件会把同 key 的第二次请求回放成首次响应。
+func login(t *testing.T, srv *httptest.Server, username, password string) string {
 	t.Helper()
-	// msg_id 必须每次唯一——幂等中间件会把同 key 的第二次请求回放成首次响应
-	// （曾导致第二个 login 拿到第一个用户的 Token）
-	resp := doJSON(t, srv, http.MethodPost, "/v1/auth/challenge",
-		fmt.Sprintf(`{"user_id":%q}`, userID), randomID("m"), "")
+	resp := doJSON(t, srv, http.MethodPost, "/v1/auth/login",
+		fmt.Sprintf(`{"username":%q,"password":%q}`, username, password), randomID("m"), "")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("challenge 期望 200，实际 %d", resp.StatusCode)
-	}
-	var ch auth.Challenge
-	if err := json.NewDecoder(resp.Body).Decode(&ch); err != nil {
-		t.Fatal(err)
-	}
-
-	var solution string
-	for i := 0; ; i++ {
-		solution = fmt.Sprintf("%d-%s", i, ch.Nonce)
-		if auth.VerifyPoW(ch.PowChallenge, solution, ch.PowDifficulty) {
-			break
-		}
-	}
-	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(ch.Nonce)))
-	body := fmt.Sprintf(`{"user_id":%q,"nonce":%q,"signed_pop":%q,"pow_solution":%q}`,
-		userID, ch.Nonce, sig, solution)
-
-	resp2 := doJSON(t, srv, http.MethodPost, "/v1/auth/login", body, randomID("m"), "")
-	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("login 期望 200，实际 %d", resp2.StatusCode)
+		t.Fatalf("login 期望 200，实际 %d: %s", resp.StatusCode, readAll(t, resp))
 	}
 	var pair auth.TokenPair
-	if err := json.NewDecoder(resp2.Body).Decode(&pair); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&pair); err != nil {
 		t.Fatal(err)
 	}
 	if pair.AccessToken == "" {
@@ -106,7 +96,7 @@ func login(t *testing.T, srv *httptest.Server, priv ed25519.PrivateKey, userID s
 }
 
 func TestScheduleActionRequiresToken(t *testing.T) {
-	deps, priv, userID := newDeps(t)
+	deps := newDeps(t)
 	srv := httptest.NewServer(httpapi.NewRouter(deps))
 	defer srv.Close()
 
@@ -118,7 +108,7 @@ func TestScheduleActionRequiresToken(t *testing.T) {
 	}
 
 	// 带合法 token → 进入真实业务校验（Phase 1.4 已收口）：空体缺 cipher → 400
-	token := login(t, srv, priv, userID)
+	token := login(t, srv, "user-1", "pass")
 	resp2 := doJSON(t, srv, http.MethodPost, "/v1/schedule/action", `{}`, "msg-2", token)
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusBadRequest {
@@ -127,10 +117,10 @@ func TestScheduleActionRequiresToken(t *testing.T) {
 }
 
 func TestReplayIsIdempotent(t *testing.T) {
-	deps, priv, userID := newDeps(t)
+	deps := newDeps(t)
 	srv := httptest.NewServer(httpapi.NewRouter(deps))
 	defer srv.Close()
-	token := login(t, srv, priv, userID)
+	token := login(t, srv, "user-1", "pass")
 
 	first := doJSON(t, srv, http.MethodPost, "/v1/schedule/action", `{}`, "msg-replay", token)
 	body1 := readAll(t, first)
@@ -152,37 +142,27 @@ func TestReplayIsIdempotent(t *testing.T) {
 }
 
 func TestMissingClientMsgIDRejected(t *testing.T) {
-	deps, _, _ := newDeps(t)
+	deps := newDeps(t)
 	srv := httptest.NewServer(httpapi.NewRouter(deps))
 	defer srv.Close()
 
-	resp := doJSON(t, srv, http.MethodPost, "/v1/auth/challenge", `{"user_id":"user-1"}`, "", "")
+	resp := doJSON(t, srv, http.MethodPost, "/v1/auth/challenge", `{}`, "", "")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("缺 client_msg_id 期望 400，实际 %d", resp.StatusCode)
 	}
 }
 
-func TestLoginRejectsBadSignature(t *testing.T) {
-	deps, _, userID := newDeps(t)
+func TestLoginRejectsBadPassword(t *testing.T) {
+	deps := newDeps(t)
 	srv := httptest.NewServer(httpapi.NewRouter(deps))
 	defer srv.Close()
 
-	resp := doJSON(t, srv, http.MethodPost, "/v1/auth/challenge",
-		fmt.Sprintf(`{"user_id":%q}`, userID), "msg-c2", "")
+	resp := doJSON(t, srv, http.MethodPost, "/v1/auth/login",
+		`{"username":"user-1","password":"wrong"}`, "msg-l2", "")
 	defer resp.Body.Close()
-	var ch auth.Challenge
-	_ = json.NewDecoder(resp.Body).Decode(&ch)
-
-	_, priv, _ := ed25519.GenerateKey(rand.Reader) // 与库内公钥不匹配
-	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(ch.Nonce)))
-	body := fmt.Sprintf(`{"user_id":%q,"nonce":%q,"signed_pop":%q,"pow_solution":"x"}`, userID, ch.Nonce, sig)
-
-	resp2 := doJSON(t, srv, http.MethodPost, "/v1/auth/login", body, "msg-l2", "")
-	defer resp2.Body.Close()
-	// PoW 先拦（400/401 PoW）；这里断言「绝不 200」即可覆盖伪造签名路径
-	if resp2.StatusCode == http.StatusOK {
-		t.Fatal("伪造签名/PoW 不应签发 Token")
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("错误密码不应签发 Token")
 	}
 }
 

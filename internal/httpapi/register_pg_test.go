@@ -42,12 +42,19 @@ func pgDeps(t *testing.T) (httpapi.Deps, *pgxpool.Pool) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 
+	issuer := auth.NewIssuer([]byte("test-secret-test-secret-test-secret"), time.Hour, 24*time.Hour)
+	epochs := auth.NewEpochStore(rdb, 24*time.Hour)
+	deny := auth.NewDenyList(rdb)
+	issuer.SetEpoch(epochs)
+	issuer.SetDeny(deny)
+
 	return httpapi.Deps{
-		Issuer:              auth.NewIssuer([]byte("test-secret-test-secret-test-secret"), time.Hour, 24*time.Hour),
+		Issuer:              issuer,
 		Challenges:          auth.NewChallengeStore(rdb, time.Minute, 2),
 		Idem:                auth.NewIdempotency(rdb, 5*time.Minute, 5*time.Minute),
 		Identities:          store.PGIdentity{Pool: pool},
 		Users:               store.UserStore{Pool: pool},
+		Credentials:         store.UserStore{Pool: pool},
 		Limiter:             auth.NewRateLimiter(rdb, 100, time.Minute),
 		RegisterLimitPerMin: 100,
 		PoWRequired:         true,
@@ -57,6 +64,9 @@ func pgDeps(t *testing.T) (httpapi.Deps, *pgxpool.Pool) {
 
 		Bundles:     store.BundlesStore{Pool: pool},
 		Broadcaster: httpapi.NoopBroadcaster{},
+
+		Deny:   deny,
+		Epochs: epochs,
 	}, pool
 }
 
@@ -71,22 +81,23 @@ func randomID(prefix string) string {
 }
 
 type regInput struct {
-	userID string
-	priv   ed25519.PrivateKey
-	pub    ed25519.PublicKey
+	userID   string
+	username string
+	password string
+	priv     ed25519.PrivateKey
+	pub      ed25519.PublicKey
 }
 
-// registerUser：走完整 Challenge-Response + PoP + PoW 完成注册。
-func registerUser(t *testing.T, srv *httptest.Server, opks int) regInput {
-	t.Helper()
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	userID := randomID("u")
+// randName：生成小写字母/数字的唯一用户名（满足 ^[a-z0-9_]{3,32}$）。
+func randName(prefix string) string {
+	return prefix + fmt.Sprintf("%x", randomBytes(8))
+}
 
-	resp := doJSON(t, srv, http.MethodPost, "/v1/auth/challenge",
-		fmt.Sprintf(`{"user_id":%q}`, userID), randomID("m"), "")
+// registerRaw：走完整 Challenge + PoW 完成注册（Plan A：用户名+密码，无 PoP）。
+// 返回原始响应；registerUser 在此基础上解析 user_id。
+func registerRaw(t *testing.T, srv *httptest.Server, username, password string, opks int, identityPub ed25519.PublicKey) *http.Response {
+	t.Helper()
+	resp := doJSON(t, srv, http.MethodPost, "/v1/auth/challenge", `{}`, randomID("m"), "")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("challenge 失败: %d", resp.StatusCode)
@@ -110,24 +121,41 @@ func registerUser(t *testing.T, srv *httptest.Server, opks int) regInput {
 			base64.StdEncoding.EncodeToString(randomBytes(64))))
 	}
 	body := fmt.Sprintf(`{
-		"user_id":%q,"identity_key_pub":%q,"signed_prekey_pub":%q,"signed_prekey_sig":%q,
-		"nonce":%q,"signed_pop":%q,"pow_solution":%q,
+		"username":%q,"password":%q,
+		"identity_key_pub":%q,"signed_prekey_pub":%q,"signed_prekey_sig":%q,
+		"nonce":%q,"pow_solution":%q,
 		"one_time_prekeys":[%s]}`,
-		userID,
-		base64.StdEncoding.EncodeToString(pub),
+		username, password,
+		base64.StdEncoding.EncodeToString(identityPub),
 		base64.StdEncoding.EncodeToString(randomBytes(32)),
 		base64.StdEncoding.EncodeToString(randomBytes(64)),
-		ch.Nonce,
-		base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(ch.Nonce))),
-		solution,
+		ch.Nonce, solution,
 		strings.Join(opkJSON, ","))
 
-	r2 := doJSON(t, srv, http.MethodPost, "/v1/users", body, randomID("m"), "")
+	return doJSON(t, srv, http.MethodPost, "/v1/users", body, randomID("m"), "")
+}
+
+// registerUser：用户名+密码注册（Plan A）+ 首批 OPK；返回 user_id / 用户名 / 密码 / IK（供 Ticket 签名）。
+func registerUser(t *testing.T, srv *httptest.Server, opks int) regInput {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	username := randName("u")
+	password := "Pw_" + fmt.Sprintf("%x", randomBytes(4))
+
+	r2 := registerRaw(t, srv, username, password, opks, pub)
 	defer r2.Body.Close()
 	if r2.StatusCode != http.StatusCreated {
 		t.Fatalf("注册期望 201，实际 %d: %s", r2.StatusCode, readAll(t, r2))
 	}
-	return regInput{userID: userID, priv: priv, pub: pub}
+	var out struct {
+		UserID  string `json:"user_id"`
+		Username string `json:"username"`
+	}
+	_ = json.NewDecoder(r2.Body).Decode(&out)
+	return regInput{userID: out.UserID, username: username, password: password, priv: priv, pub: pub}
 }
 
 func randomBytes(n int) []byte {
@@ -136,35 +164,18 @@ func randomBytes(n int) []byte {
 	return b
 }
 
-func TestRegisterRejectsMissingProofOfPossession(t *testing.T) {
+func TestRegisterRejectsDuplicateUsername(t *testing.T) {
 	deps, _ := pgDeps(t)
 	srv := httptest.NewServer(httpapi.NewRouter(deps))
 	defer srv.Close()
 
-	userID := randomID("u")
-	resp := doJSON(t, srv, http.MethodPost, "/v1/auth/challenge",
-		fmt.Sprintf(`{"user_id":%q}`, userID), randomID("m"), "")
-	defer resp.Body.Close()
-	var ch auth.Challenge
-	_ = json.NewDecoder(resp.Body).Decode(&ch)
-
-	// 公钥来自 A、签名来自 B —— 公钥置换攻击应被 PoP 拦下
-	pubA, _, _ := ed25519.GenerateKey(rand.Reader)
-	_, privB, _ := ed25519.GenerateKey(rand.Reader)
-	body := fmt.Sprintf(`{
-		"user_id":%q,"identity_key_pub":%q,"signed_prekey_pub":%q,"signed_prekey_sig":%q,
-		"nonce":%q,"signed_pop":%q,"pow_solution":"x","one_time_prekeys":[]}`,
-		userID,
-		base64.StdEncoding.EncodeToString(pubA),
-		base64.StdEncoding.EncodeToString(randomBytes(32)),
-		base64.StdEncoding.EncodeToString(randomBytes(64)),
-		ch.Nonce,
-		base64.StdEncoding.EncodeToString(ed25519.Sign(privB, []byte(ch.Nonce))))
-
-	r2 := doJSON(t, srv, http.MethodPost, "/v1/users", body, randomID("m"), "")
-	defer r2.Body.Close()
-	if r2.StatusCode == http.StatusCreated {
-		t.Fatal("公钥置换（签名与公钥不匹配）不得注册成功")
+	in := registerUser(t, srv, store.MinInitialPreKeys)
+	// 同用户名再注册（完整 challenge+PoW）→ 409 USERNAME_EXISTS
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	r := registerRaw(t, srv, in.username, "Pw_12345", store.MinInitialPreKeys, pub)
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusConflict {
+		t.Fatalf("重复用户名期望 409，实际 %d: %s", r.StatusCode, readAll(t, r))
 	}
 }
 
@@ -173,44 +184,12 @@ func TestRegisterRejectsWrongPreKeyCount(t *testing.T) {
 	srv := httptest.NewServer(httpapi.NewRouter(deps))
 	defer srv.Close()
 
-	userID := randomID("u")
-	resp := doJSON(t, srv, http.MethodPost, "/v1/auth/challenge",
-		fmt.Sprintf(`{"user_id":%q}`, userID), randomID("m"), "")
-	defer resp.Body.Close()
-	var ch auth.Challenge
-	_ = json.NewDecoder(resp.Body).Decode(&ch)
-
-	var solution string
-	for i := 0; ; i++ {
-		solution = fmt.Sprintf("%d-%s", i, ch.Nonce)
-		if auth.VerifyPoW(ch.PowChallenge, solution, ch.PowDifficulty) {
-			break
-		}
-	}
-	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
 	// 只带 3 个 OPK —— 低于首批下限 10
-	opks := []string{}
-	for i := 0; i < 3; i++ {
-		opks = append(opks, fmt.Sprintf(`{"key_id":"k%d","pub":%q,"signature":%q}`, i,
-			base64.StdEncoding.EncodeToString(randomBytes(32)),
-			base64.StdEncoding.EncodeToString(randomBytes(64))))
-	}
-	body := fmt.Sprintf(`{
-		"user_id":%q,"identity_key_pub":%q,"signed_prekey_pub":%q,"signed_prekey_sig":%q,
-		"nonce":%q,"signed_pop":%q,"pow_solution":%q,"one_time_prekeys":[%s]}`,
-		userID,
-		base64.StdEncoding.EncodeToString(pub),
-		base64.StdEncoding.EncodeToString(randomBytes(32)),
-		base64.StdEncoding.EncodeToString(randomBytes(64)),
-		ch.Nonce,
-		base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(ch.Nonce))),
-		solution,
-		strings.Join(opks, ","))
-
-	r2 := doJSON(t, srv, http.MethodPost, "/v1/users", body, randomID("m"), "")
-	defer r2.Body.Close()
-	if r2.StatusCode != http.StatusBadRequest {
-		t.Fatalf("OPK 数量越界期望 400，实际 %d", r2.StatusCode)
+	r := registerRaw(t, srv, randName("u"), "Pw_12345", 3, pub)
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("OPK 数量越界期望 400，实际 %d", r.StatusCode)
 	}
 }
 
@@ -320,7 +299,7 @@ func TestRefillPreKeysRequiresAuthAndWorks(t *testing.T) {
 		t.Fatalf("补仓未鉴权期望 401，实际 %d", r.StatusCode)
 	}
 
-	token := login(t, srv, in.priv, in.userID)
+	token := login(t, srv, in.username, in.password)
 	r2 := doJSON(t, srv, http.MethodPost, "/v1/users/me/prekeys", body, randomID("m"), token)
 	defer r2.Body.Close()
 	if r2.StatusCode != http.StatusOK {

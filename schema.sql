@@ -11,7 +11,7 @@
 --
 -- 2026-10-09 服务端架构审查修正内建：
 --   - friendships 仅 5 个有意义列 (user_id_a, user_id_b, status, encrypted_intro, created_at)，零 nickname/phone（encrypted_intro 仅 pending 期留存，accept/block 后置 NULL）
---   - users 零 display_name；昵称/备注仅存 encrypted_profile（端侧全密文）
+--   - users 零 display_name；昵称/备注仅存 encrypted_profile（端侧全密文）；username 为登录唯一标识（明文，属账号体系非业务数据），password_hash 仅哈希零明文
 --   - 全库零 entity_key 列（不接收/不存储车次/预约码等业务代号）
 --   - team_schedule_events 走全局 seq_id（UNIQUE(bundle_id, seq_id)），服务端绝对定序
 --   - relay_messages TTL 即焚（expires_at + status），与持久化事件流解耦
@@ -26,16 +26,20 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";   -- 提供 gen_random_uuid()
 -- 1) 用户：服务端零明文昵称 ------------------------------------------------
 CREATE TABLE users (
   user_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  identity_key_pub   BYTEA NOT NULL,            -- Ed25519 身份公钥
+  username           TEXT NOT NULL,            -- 人类可读唯一标识（服务端唯一约束；端侧展示用，非加密身份）
+  password_hash      TEXT NOT NULL,            -- Argon2id/PBKDF2 派生哈希（标准库 PBKDF2-HMAC-SHA256，$pbkdf2-sha256$ 格式）；服务端零明文密码
+  identity_key_pub   BYTEA NOT NULL,            -- Ed25519 身份公钥（E2EE 引擎；对用户透明，仅端侧持有私钥）
   signed_prekey_pub  BYTEA NOT NULL,            -- X25519 签名预密钥
   signed_prekey_sig  BYTEA NOT NULL,            -- 身份密钥对预密钥的签名
   push_token         TEXT,                      -- FCM/APNs；服务端不解析内容
   encrypted_profile  BYTEA,                     -- 端侧全密文（昵称/备注/头像），服务端不可读
-  recovery_vault     BYTEA,                     -- 端侧加密的主密钥恢复金库
+  recovery_vault     BYTEA,                     -- 端侧加密的主密钥恢复金库（换设备恢复 E2EE 密钥）
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
   -- 注册约束（应用层强制）：必须携带 signed_pop + pow_solution，否则拒收（防女巫/存储轰炸）
-  CONSTRAINT users_identity_key_uniq UNIQUE (identity_key_pub)
+  CONSTRAINT users_identity_key_uniq UNIQUE (identity_key_pub),
+  CONSTRAINT users_username_uniq UNIQUE (username),
+  CONSTRAINT users_username_format CHECK (username ~ '^[a-z0-9_]{3,32}$')  -- 小写字母/数字/下划线，3~32
 );
 
 -- 2) 好友关系：仅 5 列（user_id_a / user_id_b / status / encrypted_intro / created_at），零 nickname/phone --

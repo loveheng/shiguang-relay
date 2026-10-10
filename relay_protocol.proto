@@ -121,22 +121,41 @@ message AuthChallenge {
 }
 
 message RegisterRequest {
-  string user_id = 1;             // 客户端自生成 UUID
-  bytes identity_key_pub = 2;     // Ed25519 身份公钥
+  string user_id = 1 [deprecated = true]; // 旧匿名模型字段，现由服务端生成；保留以向后兼容
+  bytes identity_key_pub = 2;     // Ed25519 身份公钥（E2EE 引擎，对用户透明）
   bytes signed_prekey_pub = 3;    // X25519 签名预密钥
   bytes signed_prekey_sig = 4;    // 身份密钥对预密钥的签名
   string push_token = 5;          // FCM/APNs；服务端不解析内容
   bytes encrypted_profile = 6;     // 端侧全密文：昵称/备注/头像，服务端零明文
-  bytes signed_pop = 7;            // 对 AuthChallenge.nonce 的 Ed25519 签名（所有权证明 PoP）
-  string pow_solution = 8;         // Hashcash 解
+  bytes signed_pop = 7 [deprecated = true]; // 旧 PoP 登录凭证，Plan A 已废弃
+  string pow_solution = 8;         // Hashcash 解（注册防女巫；与用户名唯一 + 单 IP 限流并用）
+  // —— Plan A：用户名+密码（账号体系，与 E2EE 密钥解耦；服务端仅存派生哈希，零明文密码）——
+  string username = 9;            // 人类可读唯一标识（小写字母/数字/下划线 3~32）
+  string password = 10;           // 明文仅走 TLS；服务端 Argon2id/PBKDF2 哈希
   // 注意：无 display_name 字段
 }
 
 message LoginRequest {
-  string user_id = 1;
-  bytes identity_key_pub = 2;
-  bytes signed_pop = 3;           // 对 nonce 的签名
-  string pow_solution = 4;
+  string user_id = 1 [deprecated = true];
+  bytes identity_key_pub = 2 [deprecated = true];
+  bytes signed_pop = 3 [deprecated = true]; // 旧 PoP 签名
+  string pow_solution = 4 [deprecated = true];
+  // —— Plan A：用户名+密码登录（服务端校验哈希签发双 Token）——
+  string username = 5;
+  string password = 6;
+}
+
+message ChangePasswordRequest {
+  string old_password = 1;        // 校验旧密码（Plan A：仅换哈希，不动 E2EE 密钥）
+  string new_password = 2;        // 新密码（≥8 位）
+}
+
+message LookupUserResponse {      // GET /v1/users/lookup?username= 的响应（加好友「搜索」路径）
+  string user_id = 1;             // 服务端生成的 UUID
+  string username = 2;
+  bytes identity_key_pub = 3;     // 公钥身份（X3DH 用 OPK 由调用方走 prekey 端点单独拉）
+  bytes signed_prekey_pub = 4;
+  bytes signed_prekey_sig = 5;
 }
 
 message AuthResponse {
@@ -166,6 +185,13 @@ message FriendshipRequest {
   // B 用私钥解开 encrypted_intro 显示「来自 张三 的好友申请」，破解纯 UUID 审批死锁；服务端仍纯盲。
 }
 
+// 用户名搜索路径（Plan A）：A 以 Bearer 身份凭 user_id 直发，无 Ticket。
+// 防滥用靠限流 + 接收方待审批配额 ≤50 + 关系去重 409 + 接收方可拉黑；与扫码路径殊途同归落 pending。
+message FriendRequest {
+  string to_user_id = 1;          // 由 GET /v1/users/lookup 取得
+  bytes encrypted_intro = 2;      // A 用 lookup/prekey 取得的 B 公钥 ECIES 加密自报家门；服务端纯盲，可缺省
+}
+
 message FriendshipResponse {
   string invite_id = 1;
   bool accept = 2;                // 客户端手动批准，不自动
@@ -176,6 +202,7 @@ message FriendshipView {
   string status = 2;              // pending / accepted / blocked
   int64 created_at = 3;
   bytes encrypted_intro = 4;      // 仅 pending 期携带：A 用 B 公钥 ECIES 加密的自报家门（B 端侧私钥解密显示「来自 张三 的好友申请」）；accepted/blocked 后清空
+  string username = 5;            // 对方用户名（明文标识符；解密 encrypted_profile 前的展示锚点，v0.1.7 Plan A）
   // 无 nickname：展示名由本端 encrypted_profile 解密得到
 }
 

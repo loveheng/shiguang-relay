@@ -51,6 +51,10 @@ func main() {
 		store.BundlesStore{Pool: pool}, wss.NoopWakePusher{}) // Phase 1.7 换 FCM/APNs Worker 池
 
 	issuer := auth.NewIssuer(cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL)
+	epochs := auth.NewEpochStore(rdb, cfg.RefreshTTL)
+	deny := auth.NewDenyList(rdb)
+	issuer.SetEpoch(epochs) // 改密踢会话：Issue 内嵌纪元 + 中间件比对
+	issuer.SetDeny(deny)    // 登出/rotation 重用检测：中间件查 jti 黑名单
 
 	deps := httpapi.Deps{
 		Issuer:      issuer,
@@ -58,6 +62,15 @@ func main() {
 		Idem:        auth.NewIdempotency(rdb, cfg.IdempotentTTL, cfg.IdempotentTTL),
 		Identities:  store.PGIdentity{Pool: pool},
 		PoWRequired: cfg.PoWRequired,
+
+		Credentials: store.UserStore{Pool: pool}, // 用户名+密码校验（Plan A）
+
+		LoginLimiter:    auth.NewRateLimiter(rdb, cfg.LoginLimitPerMin, time.Minute),
+		LoginGuard:      auth.NewLoginGuard(rdb, cfg.LoginMaxFails, cfg.LoginLockWindow),
+		LoginLockWindow: cfg.LoginLockWindow,
+
+		Deny:   deny,
+		Epochs: epochs,
 
 		Users:               store.UserStore{Pool: pool},
 		Limiter:             auth.NewRateLimiter(rdb, cfg.RegisterLimitPerMin, time.Minute),

@@ -9,3 +9,4 @@ cmd/relayd/relayd
 
 # 生成物由 scripts/gen-proto.sh 产出后提交（双端契约只读产物，CI 校验同步）
 # gen/ 不在忽略列表——生成物入仓，保证双端面向同一份只读契约编程
+context/CURRENT

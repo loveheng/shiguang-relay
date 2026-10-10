@@ -26,9 +26,9 @@ func TestParticipatingAndSync(t *testing.T) {
 	c := registerUser(t, srv, store.MinInitialPreKeys) // 非成员
 	makeFriends(t, srv, a, b)
 
-	tokenA := login(t, srv, a.priv, a.userID)
-	tokenB := login(t, srv, b.priv, b.userID)
-	tokenC := login(t, srv, c.priv, c.userID)
+	tokenA := login(t, srv, a.username, a.password)
+	tokenB := login(t, srv, b.username, b.password)
+	tokenC := login(t, srv, c.username, c.password)
 
 	body := fmt.Sprintf(`{"action":"PROPOSE","cipher":%q,"proposal_type":"CONSENSUS",
 		"participant_uids":[%q],
@@ -127,7 +127,7 @@ func TestVaultEnvelopesAppendOnly(t *testing.T) {
 	defer srv.Close()
 
 	a := registerUser(t, srv, store.MinInitialPreKeys)
-	tokenA := login(t, srv, a.priv, a.userID)
+	tokenA := login(t, srv, a.username, a.password)
 	bundleID := randomID("u")
 
 	post := func(ver int, payload string) int {
@@ -168,9 +168,9 @@ func TestRelayPendingAndAck(t *testing.T) {
 	c := registerUser(t, srv, store.MinInitialPreKeys) // 陌生人
 	makeFriends(t, srv, a, b)
 
-	tokenA := login(t, srv, a.priv, a.userID)
-	tokenB := login(t, srv, b.priv, b.userID)
-	login(t, srv, c.priv, c.userID) // C 仅注册，不参与信令
+	tokenA := login(t, srv, a.username, a.password)
+	tokenB := login(t, srv, b.username, b.password)
+	login(t, srv, c.username, c.password) // C 仅注册，不参与信令
 
 	// 陌生人直投 → 403（§1.7 第 2 条）
 	r0 := doJSON(t, srv, http.MethodPost, "/v1/relay/msg",
