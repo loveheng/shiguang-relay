@@ -1,0 +1,60 @@
+name: build-image
+
+# 推送 tag 时自动构建并推送 Docker 镜像到 GHCR（GitHub Container Registry）。
+# 触发条件：refs/tags/v*   （例如 v1.2.3、v1.2.3-rc1）
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write # 推送到 GHCR 必需
+
+env:
+  REGISTRY: ghcr.io
+  # 镜像名默认 <owner>/<repo>，改为你想要的可用 IMAGE_NAME 覆盖。
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (多架构)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image metadata / tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # tag=v1.2.3 -> 1.2.3, 同时打 latest（仅对不含预发布后缀的稳定 tag）
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}},priority=100
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
