@@ -1,6 +1,6 @@
 # shiguang-relay · 盲中继服务端镜像
 # Phase 0 只交付骨架；Phase 1 落地 cmd/relayd 后本文件即可直接 build。
-FROM golang:1.23-alpine AS build
+FROM golang:1.26-alpine AS build
 
 WORKDIR /src
 COPY go.mod go.sum* ./
