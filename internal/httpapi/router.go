@@ -187,6 +187,9 @@ type logoutReq struct {
 type changePasswordReq struct {
 	OldPassword string `json:"old_password"`
 	NewPassword string `json:"new_password"`
+	// NewRecoveryVault：新密码派生 KEK 重封的金库密文（base64，端侧改密原子重封，v3 拍板）。
+	// 与密码哈希同事务落库；缺省=不改金库（兼容无金库账号）。
+	NewRecoveryVault []byte `json:"new_recovery_vault"`
 }
 
 func (d Deps) handleChallenge(w http.ResponseWriter, r *http.Request) {
@@ -300,7 +303,9 @@ func (d Deps) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusInternalServerError, apierr.Internal, "failed to hash password", nil)
 		return
 	}
-	if err := d.Users.UpdatePassword(r.Context(), caller, newHash); err != nil {
+	// v3 拍板：改密=原子重封——旧密文验证通过后，新哈希与新金库密文单事务同落；
+	// 缺省 new_recovery_vault 时不改金库（纯改密兼容）。
+	if err := d.Users.UpdatePasswordWithVault(r.Context(), caller, newHash, req.NewRecoveryVault); err != nil {
 		apierr.Write(w, http.StatusInternalServerError, apierr.Internal, "failed to update password", nil)
 		return
 	}

@@ -127,17 +127,38 @@ func (s UserStore) CheckPasswordByUserID(ctx context.Context, userID, password s
 	return auth.VerifyPassword(hash, password), nil
 }
 
-// UpdatePassword：更新密码哈希（Plan A：仅换哈希，不动 E2EE 密钥）。
-func (s UserStore) UpdatePassword(ctx context.Context, userID, newHash string) error {
-	tag, err := s.Pool.Exec(ctx,
-		`UPDATE users SET password_hash = $1, updated_at = now() WHERE user_id = $2`, newHash, userID)
+// UpdatePasswordWithVault：改密原子落库（单事务）——新密码哈希 + 新 recovery_vault 同写。
+// v3 拍板（schedule-app §11「Plan A v3 换机恢复」）：金库包裹钥由登录密码派生，
+// 改密即重封金库，两写必须原子——中途失败留下旧锁新密码的死金库不可接受。
+// vault 为 nil 时不改金库（纯改密，兼容无金库账号）。
+func (s UserStore) UpdatePasswordWithVault(ctx context.Context, userID, newHash string, vault []byte) error {
+	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("更新密码失败: %w", err)
+		return fmt.Errorf("开启改密事务失败: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrUserNotFound
+	defer tx.Rollback(ctx) //nolint:errcheck // 提交成功后 Rolloff 为 no-op
+	if vault != nil {
+		tag, err := tx.Exec(ctx,
+			`UPDATE users SET password_hash = $1, recovery_vault = $2, updated_at = now() WHERE user_id = $3`,
+			newHash, vault, userID)
+		if err != nil {
+			return fmt.Errorf("更新密码与金库失败: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrUserNotFound
+		}
+	} else {
+		tag, err := tx.Exec(ctx,
+			`UPDATE users SET password_hash = $1, updated_at = now() WHERE user_id = $2`,
+			newHash, userID)
+		if err != nil {
+			return fmt.Errorf("更新密码失败: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrUserNotFound
+		}
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // PublicIdentity：用户名搜索返回的公钥身份（不含私钥，服务端纯盲）。
