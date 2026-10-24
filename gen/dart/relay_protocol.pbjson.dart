@@ -47,6 +47,8 @@ const ActionType$json = {
     {'1': 'CLIENT_ACK', '2': 25},
     {'1': 'PING', '2': 26},
     {'1': 'ADD_MEMBER', '2': 27},
+    {'1': 'PATCH_STEP_TIME', '2': 28},
+    {'1': 'LEAVE', '2': 29},
   ],
 };
 
@@ -60,7 +62,7 @@ final $typed_data.Uint8List actionTypeDescriptor = $convert.base64Decode(
     '0KCVNURVBfTk9URRASEg8KC0FUVEFDSF9GQUNUEBMSDwoLVVBEQVRFX0ZBQ1QQFBIPCgtERVRB'
     'Q0hfRkFDVBAVEhIKDkZSRUVNQVNLX1FVRVJZEBYSFQoRRlJFRU1BU0tfUkVTUE9OU0UQFxIQCg'
     'xERUxJVkVSWV9BQ0sQGBIOCgpDTElFTlRfQUNLEBkSCAoEUElORxAaEg4KCkFERF9NRU1CRVIQ'
-    'Gw==');
+    'GxITCg9QQVRDSF9TVEVQX1RJTUUQHBIJCgVMRUFWRRAd');
 
 @$core.Deprecated('Use envelopeDescriptor instead')
 const Envelope$json = {
@@ -476,7 +478,26 @@ const RelayMessage$json = {
     {'1': 'kind', '3': 4, '4': 1, '5': 9, '10': 'kind'},
     {'1': 'cipher', '3': 5, '4': 1, '5': 12, '10': 'cipher'},
     {'1': 'expires_at', '3': 6, '4': 1, '5': 3, '10': 'expiresAt'},
+    {
+      '1': 'header',
+      '3': 7,
+      '4': 3,
+      '5': 11,
+      '6': '.shiguang.relay.v1.RelayMessage.HeaderEntry',
+      '10': 'header'
+    },
   ],
+  '3': [RelayMessage_HeaderEntry$json],
+};
+
+@$core.Deprecated('Use relayMessageDescriptor instead')
+const RelayMessage_HeaderEntry$json = {
+  '1': 'HeaderEntry',
+  '2': [
+    {'1': 'key', '3': 1, '4': 1, '5': 9, '10': 'key'},
+    {'1': 'value', '3': 2, '4': 1, '5': 9, '10': 'value'},
+  ],
+  '7': {'7': true},
 };
 
 /// Descriptor for `RelayMessage`. Decode as a `google.protobuf.DescriptorProto`.
@@ -484,7 +505,9 @@ final $typed_data.Uint8List relayMessageDescriptor = $convert.base64Decode(
     'CgxSZWxheU1lc3NhZ2USFQoGbXNnX2lkGAEgASgJUgVtc2dJZBIqChFyZWNpcGllbnRfdXNlcl'
     '9pZBgCIAEoCVIPcmVjaXBpZW50VXNlcklkEiQKDnNlbmRlcl91c2VyX2lkGAMgASgJUgxzZW5k'
     'ZXJVc2VySWQSEgoEa2luZBgEIAEoCVIEa2luZBIWCgZjaXBoZXIYBSABKAxSBmNpcGhlchIdCg'
-    'pleHBpcmVzX2F0GAYgASgDUglleHBpcmVzQXQ=');
+    'pleHBpcmVzX2F0GAYgASgDUglleHBpcmVzQXQSQwoGaGVhZGVyGAcgAygLMisuc2hpZ3Vhbmcu'
+    'cmVsYXkudjEuUmVsYXlNZXNzYWdlLkhlYWRlckVudHJ5UgZoZWFkZXIaOQoLSGVhZGVyRW50cn'
+    'kSEAoDa2V5GAEgASgJUgNrZXkSFAoFdmFsdWUYAiABKAlSBXZhbHVlOgI4AQ==');
 
 @$core.Deprecated('Use relayAckRequestDescriptor instead')
 const RelayAckRequest$json = {

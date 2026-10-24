@@ -12,6 +12,7 @@ package httpapi_test
 
 import (
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -20,7 +21,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"shiguang-relay/internal/httpapi"
 	"shiguang-relay/internal/store"
 )
@@ -67,6 +67,13 @@ func call(t *testing.T, srv *httptest.Server, method, path, body, msgID, token s
 	return resp.StatusCode, m, resp.Header
 }
 
+// call2：call 的双值便捷包装（不关心响应头时用）。
+func call2(t *testing.T, srv *httptest.Server, method, path, body, msgID, token string) (int, map[string]any) {
+	t.Helper()
+	c, m, _ := call(t, srv, method, path, body, msgID, token)
+	return c, m
+}
+
 // proposeEx：发起活动（PROPOSE），显式带上成员密钥信封。
 // members = 除发起人外的其他受邀成员（propose() 会自动把 caller 加进 participant_uids）。
 func proposeEx(t *testing.T, srv *httptest.Server, token string, caller regInput, members []regInput, cipher string, envJSON string) map[string]any {
@@ -95,7 +102,8 @@ func act(t *testing.T, srv *httptest.Server, token, bundleID, action, cipher, ex
 		body += "," + extra
 	}
 	body += "}"
-	return call(t, srv, http.MethodPost, "/v1/schedule/action", body, randomID("m"), token)
+	code, m, _ := call(t, srv, http.MethodPost, "/v1/schedule/action", body, randomID("m"), token)
+	return code, m
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +154,7 @@ func TestSimMultiPersonActivity(t *testing.T) {
 	tokenCarol := login(t, srv, carol.username, carol.password)
 	tokenDave := login(t, srv, dave.username, dave.password)
 	tokenEve := login(t, srv, eve.username, eve.password)
+	_ = tokenEve // Eve 仅建好友不入包（存量审计 harness 保留变量）
 
 	// ===== 阶段 1：建好友（双通道）=====
 	// Alice 扫码邀请 Bob（Ticket 通道）；Dave 扫码邀请 Eve
@@ -228,149 +237,164 @@ func TestSimMultiPersonActivity(t *testing.T) {
 	}
 	// 非事实动作 + 陈旧 revision → 409
 	if c, _ := act(t, srv, tokenBob, bundleID, "ACCEPT", "x", `"expected_revision":999`); c != http.StatusConflict {
-		rec("OBSERVIDATION", "陈旧 revision 非事实动作", fmt.Sprintf("期望 409，实际 %d", c))
+		rec("OBSERVATION", "陈旧 revision 非事实动作", fmt.Sprintf("期望 409，实际 %d", c))
 	}
 
-	// —— GAP：base_revision 是「只写不增」的 ——
-	// 经历了 PATCH_TIME（结构性动作）后，base_revision 仍应为 1（从未自增），
-	// 于是非事实动作带 expected_revision=1 仍放行。直接查库取证。
+	// —— 修复验证（v0.1.10 案A拍板 2026-10-25）：base_revision 定型 bundle 级结构版本 ——
+	// 每个非事实动作自增 1、事实三动作豁免；校验 opt-in（仅显式携带 expected_revision 才比对），
+	// 靶向实体级冲突判定归端侧 FSM（设计 §5.4 已同步表述）。此前「只写不增→乐观锁名存实亡」缺口就此关闭。
 	var baseRev int
 	if err := pool.QueryRow(t.Context(), `SELECT base_revision FROM bundles WHERE bundle_id=$1`, bundleID).Scan(&baseRev); err != nil {
 		t.Fatalf("查 base_revision 失败: %v", err)
 	}
-	if baseRev == 1 {
-		// 再发一个带 expected_revision=1 的非事实动作，依然 200 —— 证明乐观锁名存实亡
-		c, _ := act(t, srv, tokenCarol, bundleID, "VOTE", "rev-check", `"expected_revision":1`)
-		if c == http.StatusOK {
-			rec("DEFECT", "base_revision 永不自增→乐观锁失效",
-				"经历 PATCH_TIME 后 base_revision 仍为 1，expected_revision 守卫等同于常量校验，多步并发编辑的因果冲突无法被侦测")
-		}
-	}
-
-	// —— GAP：ADD_MEMBER 允许注入「非好友」且无需发起人同意 ——
-	// Bob（普通成员，非发起人）把 Dave（与 Alice 非好友）拉进包
-	c, m := act(t, srv, tokenBob, bundleID, "ADD_MEMBER", "add-dave", fmt.Sprintf(`"add_member_uids":[%q]`, dave.userID))
-	if c != http.StatusOK {
-		rec("OBSERVATION", "ADD_MEMBER 普通成员", fmt.Sprintf("期望 200，实际 %d: %v", c, m))
+	if baseRev <= 1 {
+		rec("DEFECT", "base_revision 未随非事实动作自增",
+			fmt.Sprintf("经历 8 个非事实协同动作（PATCH_TIME/VOTE/STEP_NOTE 等）后 base_revision 仍为 %d，期望 >1（案A 每非事实动作自增）", baseRev))
 	} else {
-		// Dave 现在应能在包内行动（即便他不是 Alice 的好友、也未被 Alice 邀请）
-		c2, _ := act(t, srv, tokenDave, bundleID, "ACCEPT", "dave-accept", "")
-		if c2 == http.StatusOK {
-			rec("DEFECT", "ADD_MEMBER 越权注入成员",
-				"任意普通成员可把发起人非好友的人拉进方案包，且与 PROPOSE 的「双向 accepted 好友」准入严管不一致；被加人无需发起人同意即可读写包内全部内容")
+		// 陈旧 revision（=1）+ 非事实动作 → 409 STALE_REVISION：整体重构类的因果守卫活了
+		if c, _ := act(t, srv, tokenCarol, bundleID, "VOTE", "rev-check", `"expected_revision":1`); c != http.StatusConflict {
+			rec("DEFECT", "陈旧 base_revision 未打回",
+				fmt.Sprintf("expected_revision=1（现=%d）+ 非事实动作期望 409 STALE_REVISION，实际 %d", baseRev, c))
 		}
-	}
-
-	// —— GAP：TRANSFER_INITIATOR 是「装饰性」的 ——
-	// Alice 把发起人转给 Dave，但 bundles.initiator_id 实际不变
-	c, _ = act(t, srv, tokenAlice, bundleID, "TRANSFER_INITIATOR", "transfer", "")
-	if c == http.StatusOK {
-		var initiator string
-		_ = pool.QueryRow(t.Context(), `SELECT initiator_id FROM bundles WHERE bundle_id=$1`, bundleID).Scan(&initiator)
-		if initiator != alice.userID {
-			rec("OBSERVATION", "TRANSFER_INITIATOR 生效", "initiator_id 已被改写")
+		// 不携带 expected_revision → opt-in 放行（普通平权动作永不因版本互打回，§5.4 防惊群口径）
+		if c, _ := act(t, srv, tokenCarol, bundleID, "VOTE", "rev-optin", ""); c != http.StatusOK {
+			rec("DEFECT", "不带 expected_revision 被误拦",
+				fmt.Sprintf("opt-in 口径下不携带即放行，期望 200，实际 %d", c))
 		} else {
-			// Dave 尝试落槌（应因仍非真正发起人而 403）
-			c2, _ := act(t, srv, tokenDave, bundleID, "FORCE_FINALIZE", "dave-finalize", "")
-			if c2 == http.StatusForbidden {
-				rec("DEFECT", "TRANSFER_INITIATOR 不生效",
-					"动作被接受（200）但 bundles.initiator_id 未改写，名义新发起人 Dave 仍无法落槌（403），旧发起人 Alice 仍可；转移形同虚设")
+			// 上述成功 VOTE 应恰好自增 1（事实动作与失败动作均不推进计数）
+			var baseRev2 int
+			_ = pool.QueryRow(t.Context(), `SELECT base_revision FROM bundles WHERE bundle_id=$1`, bundleID).Scan(&baseRev2)
+			if baseRev2 != baseRev+1 {
+				rec("DEFECT", "base_revision 自增步长不对",
+					fmt.Sprintf("一次非事实成功动作后 %d→%d，期望恰好 +1", baseRev, baseRev2))
 			}
 		}
 	}
 
-	// —— GAP：MEMBER_REMOVED 是「装饰性」的 ——
-	// Alice「移除」Dave，但 participant_uids 不变，Dave 仍可行动
-	c, _ = act(t, srv, tokenAlice, bundleID, "MEMBER_REMOVED", "remove-dave", fmt.Sprintf(`"add_member_uids":[%q]`, dave.userID))
-	if c == http.StatusOK {
-		var stillIn bool
-		_ = pool.QueryRow(t.Context(), `SELECT $1::uuid = ANY(participant_uids) FROM bundles WHERE bundle_id=$2`, dave.userID, bundleID).Scan(&stillIn)
-		if stillIn {
-			c2, _ := act(t, srv, tokenDave, bundleID, "VOTE", "dave-after-remove", "")
-			if c2 == http.StatusOK {
-				rec("DEFECT", "MEMBER_REMOVED 不生效",
-					"动作被接受（200）但 Dave 仍在 participant_uids，被「移除」者依旧能读写包内全部内容（成员 ACL 只看 participant_uids）")
-			}
-		}
+	// —— 修复验证（v0.1.10）：ADD_MEMBER 发起人独占 + 双向 accepted 准入 ——
+	// Bob（普通成员，非发起人）拉 Dave（与 Alice 非好友）→ 403，两道防线合一对齐 PROPOSE 准入。
+	c, m := act(t, srv, tokenBob, bundleID, "ADD_MEMBER", "add-dave", fmt.Sprintf(`"add_member_uids":[%q]`, dave.userID))
+	if c != http.StatusForbidden {
+		rec("DEFECT", "ADD_MEMBER 越权拉人未拦", fmt.Sprintf("普通成员拉发起人非好友期望 403，实际 %d: %v", c, m))
+	}
+	var daveIn bool
+	_ = pool.QueryRow(t.Context(), `SELECT $1::uuid = ANY(participant_uids) FROM bundles WHERE bundle_id=$2`, dave.userID, bundleID).Scan(&daveIn)
+	if daveIn {
+		rec("DEFECT", "ADD_MEMBER 越权注入成员", "非发起人 ADD_MEMBER 被 403 但 Dave 仍在 participant_uids")
 	}
 
-	// —— REKEY：key_version +1（正常）——
-	c, m = act(t, srv, tokenAlice, bundleID, "REKEY", "rekey", fmt.Sprintf(`"member_key_envelopes":%s`, envsJSON(2, alice.userID, bob.userID, carol.UserID, dave.userID)))
+	// —— REKEY：key_version +1（正常，仅包内成员信封）——
+	c, m = act(t, srv, tokenAlice, bundleID, "REKEY", "rekey", fmt.Sprintf(`"member_key_envelopes":%s`, envsJSON(2, alice.userID, bob.userID, carol.userID)))
 	if c != http.StatusOK {
 		rec("OBSERVATION", "REKEY", fmt.Sprintf("期望 200，实际 %d: %v", c, m))
 	}
 
-	// —— GAP：quorum 从未被强制 ——
-	// 本包 quorum=5，但只有 Alice 一人落槌即 CONFIRMED
-	c, _ = act(t, srv, tokenBob, bundleID, "FORCE_FINALIZE", "bob-finalize", "")
-	if c != http.StatusForbidden {
-		rec("DEFECT", "FORCE_FINALIZE 非发起人", fmt.Sprintf("期望 403，实际 %d", c))
+	// —— 修复验证（v0.1.10）：TRANSFER_INITIATOR 明文 transfer_to 驱动 initiator_id 改写 ——
+	c, m = act(t, srv, tokenAlice, bundleID, "TRANSFER_INITIATOR", "transfer", fmt.Sprintf(`"transfer_to":%q`, bob.userID))
+	if c != http.StatusOK {
+		rec("DEFECT", "TRANSFER_INITIATOR 不生效", fmt.Sprintf("发起人转移期望 200，实际 %d: %v", c, m))
+	} else {
+		var initiator string
+		_ = pool.QueryRow(t.Context(), `SELECT initiator_id::text FROM bundles WHERE bundle_id=$1`, bundleID).Scan(&initiator)
+		if initiator != bob.userID {
+			rec("DEFECT", "TRANSFER_INITIATOR 不生效", fmt.Sprintf("transfer_to=%s 但 initiator_id 未改写（现=%s）", bob.userID, initiator))
+		} else {
+			// 旧发起人失权：Alice CANCEL → 403
+			c2, _ := act(t, srv, tokenAlice, bundleID, "CANCEL", "old-cancel", "")
+			if c2 != http.StatusForbidden {
+				rec("DEFECT", "TRANSFER_INITIATOR 后旧发起人未失权", fmt.Sprintf("旧发起人 CANCEL 期望 403，实际 %d", c2))
+			}
+		}
 	}
-	c, m = act(t, srv, tokenAlice, bundleID, "FORCE_FINALIZE", "alice-finalize", "")
+
+	// —— 改判（设计 §4.1，2026-10-24 对账定稿）：quorum 仲裁归端侧 FSM，服务端不做票数聚合 ——
+	// 新发起人 Bob 1 人落槌即 CONFIRMED 是设计内行为（服务端只做显式终态门禁）；
+	// 模拟测试原期望「quorum=5 须 5 票」陈旧，本条从 DEFECT 移入 OBSERVATION 留痕。
+	c, m = act(t, srv, tokenBob, bundleID, "FORCE_FINALIZE", "bob-finalize", "")
 	if c != http.StatusOK {
 		rec("OBSERVATION", "发起人落槌", fmt.Sprintf("期望 200，实际 %d: %v", c, m))
 	} else {
-		rec("DEFECT", "quorum 不强制", "CONSENSUS 包 quorum=5，仅发起人 1 人即敲定 CONFIRMED；quorum 仅入库从未参与仲裁")
+		rec("OBSERVATION", "quorum 不仲裁（设计改判，非缺陷）",
+			"CONSENSUS 包 quorum=5，新发起人 1 人落槌即 CONFIRMED——§4.1 对账（2026-10-24）定稿服务端不做票数聚合，quorum 判定归端侧 FSM；原模拟期望陈旧")
 	}
 
-	// —— GAP：REOPEN 是死动作 ——
-	// 敲定后任何 REOPEN 都被终态拦截（409），即「已确认不可重开」被硬编码
-	c, _ = act(t, srv, tokenAlice, bundleID, "REOPEN", "reopen", "")
-	if c == http.StatusConflict {
-		rec("OBSERVATION", "REOPEN 死动作", "bundle 一旦 CONFIRMED 即永久不可重开（REOPEN 动作枚举存在但永远 409），且 AppendEvent 也从不把 status 置回 OPEN")
-	}
-	// 敲定后一切动作→409
+	// —— 敲定后动作拦截（显式终态门禁）——
 	if c, _ := act(t, srv, tokenBob, bundleID, "ACCEPT", "after-confirm", ""); c != http.StatusConflict {
 		rec("OBSERVATION", "敲定后动作拦截", fmt.Sprintf("期望 409，实际 %d", c))
 	}
 
+	// —— 修复验证（v0.1.10）：REOPEN 终态门禁白名单第三动作（CONSENSUS 包内平权 §4.4）——
+	// 敲定后 REOPEN 不再 409：放行且显式置回 STALLED，普通动作重新可入。
+	c, m = act(t, srv, tokenAlice, bundleID, "REOPEN", "reopen", "")
+	if c != http.StatusOK {
+		rec("DEFECT", "REOPEN 终态门禁缺口未实装", fmt.Sprintf("CONSENSUS 成员敲定后 REOPEN 期望 200，实际 %d: %v", c, m))
+	} else if m["status"] != "STALLED" {
+		rec("DEFECT", "REOPEN 后状态未置回", fmt.Sprintf("期望 status=STALLED，实际 %v", m["status"]))
+	} else if c2, _ := act(t, srv, tokenBob, bundleID, "ACCEPT", "after-reopen", ""); c2 != http.StatusOK {
+		rec("DEFECT", "REOPEN 后普通动作不可入", fmt.Sprintf("重开后 ACCEPT 期望 200，实际 %d", c2))
+	}
+
 	// ===== 阶段 4：发现与同步 =====
 	for _, tok := range []string{tokenBob, tokenCarol, tokenDave} {
-		c, m := call(t, srv, http.MethodGet, "/v1/bundles/participating?status=active", "", randomID("m"), tok)
+		c, m := call2(t, srv, http.MethodGet, "/v1/bundles/participating?status=active", "", randomID("m"), tok)
 		if c != http.StatusOK {
 			rec("DEFECT", "参与包发现", fmt.Sprintf("期望 200，实际 %d: %v", c, m))
 		}
 	}
 	// 增量同步（since_seq=0 全量）
-	c, m := call(t, srv, http.MethodGet, "/v1/schedule/sync?bundle_id="+bundleID+"&since_seq=0", "", randomID("m"), tokenBob)
+	c, m = call2(t, srv, http.MethodGet, "/v1/schedule/sync?bundle_id="+bundleID+"&since_seq=0", "", randomID("m"), tokenBob)
 	if c != http.StatusOK {
 		rec("DEFECT", "增量同步", fmt.Sprintf("期望 200，实际 %d: %v", c, m))
 	}
 	// 成员密钥信封
-	c, m = call(t, srv, http.MethodGet, "/v1/bundles/"+bundleID+"/key-envelopes", "", randomID("m"), tokenBob)
+	c, m = call2(t, srv, http.MethodGet, "/v1/bundles/"+bundleID+"/key-envelopes", "", randomID("m"), tokenBob)
 	if c != http.StatusOK {
 		rec("DEFECT", "成员密钥信封", fmt.Sprintf("期望 200，实际 %d: %v", c, m))
 	}
 	// 金库 append/list
-	if c, m := call(t, srv, http.MethodPost, "/v1/vault/envelopes",
+	if c, m := call2(t, srv, http.MethodPost, "/v1/vault/envelopes",
 		fmt.Sprintf(`{"bundle_id":%q,"key_ver":1,"wrapped_keys":%q}`, bundleID, cipherB64("vault-blob")), randomID("m"), tokenBob); c != http.StatusCreated {
 		rec("OBSERVATION", "金库 append", fmt.Sprintf("期望 201，实际 %d: %v", c, m))
 	}
 
-	// —— GAP：读接口同样被幂等缓存，可能返回陈旧数据 / 跨端点串味 ——
-	// (a) 同一 client_msg_id 复用于不同 GET → 返回首个端点缓存响应（去重键不含 path）
-	c1, m1, h1 := call(t, srv, http.MethodGet, "/v1/friends", "", "IDEM-COLLIDE", tokenBob)
-	c2, m2, h2 := call(t, srv, http.MethodGet, "/v1/bundles/participating?status=active", "", "IDEM-COLLIDE", tokenBob)
-	if h2.Get("X-Idempotent-Replay") == "1" && m1 != nil {
-		// 第二次应返回 participating，却回放了 /friends 的缓存体
-		if _, ok := m2["friends"]; ok && _, ok2 := m2["bundles"]; !ok2 {
+	// —— 修复验证（v0.1.10）：幂等去重键含 method+path + GET 直通 ——
+	// (a) 跨端点：同一 client_msg_id 先打写端点 A（relay 发信）再打写端点 B（schedule 动作），
+	//     不得回放 A 的缓存体（键=idem:{method}:{path}:{client_msg_id}）。
+	c1, _, _ := call(t, srv, http.MethodPost, "/v1/relay/msg",
+		fmt.Sprintf(`{"recipient_user_id":%q,"kind":"ping","cipher":%q}`, bob.userID, cipherB64("idem-collide")),
+		"IDEM-COLLIDE", tokenAlice)
+	if c1 != http.StatusAccepted {
+		rec("OBSERVATION", "幂等跨端点前置", fmt.Sprintf("relay 发信期望 202，实际 %d", c1))
+	} else {
+		c2, m2, h2 := call(t, srv, http.MethodPost, "/v1/schedule/action",
+			fmt.Sprintf(`{"bundle_id":%q,"action":"ACCEPT","cipher":%q}`, bundleID, cipherB64("idem-accept")),
+			"IDEM-COLLIDE", tokenBob)
+		if h2.Get("X-Idempotent-Replay") == "1" || m2["bundle_id"] == nil {
 			rec("DEFECT", "幂等去重键不含 path→跨端点串缓存",
-				fmt.Sprintf("用同一 client_msg_id 先后打 /friends(=%d) 与 /bundles/participating，第二次被打上 X-Idempotent-Replay 并回放了 /friends 的响应体（含 friends 键、无 bundles 键）", c1))
+				fmt.Sprintf("同 client_msg_id 先后打 /relay/msg(=%d) 与 /schedule/action(=%d)，第二次%s（含 bundle_id 键=%v）",
+					c1, c2, map[bool]string{true: "被回放缓存"}[h2.Get("X-Idempotent-Replay") == "1"], m2["bundle_id"] != nil))
 		}
 	}
-	// (b) 同一 GET 复用 client_msg_id，包内新增事件后再次拉取仍返回旧缓存（陈旧读）
-	_, _ = act(t, srv, tokenCarol, bundleID, "STEP_NOTE", "post-cache", "") // 注意：此时 bundle 已确认会 409，故改为对一个仍 OPEN 的包测——见下方额外包
-	_ = c1
-	_ = h1
+	// (b) GET 直通：同一 client_msg_id 复用于 sync，包内新增事件后二次拉取必须拿到新事件
+	//     （读接口不走写缓存，杜绝 300s 陈旧回放）。
+	_, mA, _ := call(t, srv, http.MethodGet, "/v1/schedule/sync?bundle_id="+bundleID+"&since_seq=0", "", "IDEM-SYNC-MAIN", tokenBob)
+	n0 := len(extractEvents(mA))
+	_, _ = act(t, srv, tokenCarol, bundleID, "STEP_NOTE", "post-cache", "")
+	_, mB, hB := call(t, srv, http.MethodGet, "/v1/schedule/sync?bundle_id="+bundleID+"&since_seq=0", "", "IDEM-SYNC-MAIN", tokenBob)
+	n1 := len(extractEvents(mB))
+	if hB.Get("X-Idempotent-Replay") == "1" || n1 <= n0 {
+		rec("DEFECT", "读接口被幂等缓存→陈旧数据",
+			fmt.Sprintf("sync 复用同一 client_msg_id，包内新增事件后第二次未拿到增量（事件数 %d→%d，replay=%q），读接口不应走写接口的 300s 去重", n0, n1, hB.Get("X-Idempotent-Replay")))
+	}
 
-	// ===== 阶段 5：补充一个「未过期」对比包 + 过期不强制的演示 =====
+	// ===== 阶段 5：补充一个「未过期」对比包 + TTL/MEMBER_REMOVED 探针 =====
 	// 新建一个 expires_at 设在过去的包，验证服务端不会因过期而拒绝动作
 	b2 := proposeEx(t, srv, tokenAlice, alice, []regInput{bob},
 		"过期对比包", envsJSON(1, alice.userID, bob.userID))
 	b2id, _ := b2["bundle_id"].(string)
 	past := int64(1) // 1970，必然过期
-	c, m = act(t, srv, tokenBob, b2id, "ACCEPT", "expired-accept", fmt.Sprintf(`"expires_at_unused":%d`, past))
-	// 注：expires_at 在 PROPOSE 时若由客户端传过去才生效；这里仅演示动作不被服务端 expiry 拦截
+	c, m = act(t, srv, tokenBob, b2id, "ACCEPT", "expired-accept", fmt.Sprintf(`"expires_at":%d`, past))
+	// 注：expires_at 仅在 PROPOSE 时由客户端传入生效；这里仅演示动作不被服务端 expiry 拦截
 	if c == http.StatusOK {
 		// 查库确认该包 status 并非 EXPIRED
 		var st string
@@ -381,31 +405,34 @@ func TestSimMultiPersonActivity(t *testing.T) {
 			fmt.Sprintf("服务端没有后台/查询期把过期包置为 EXPIRED，也从不把 lifecycle 置为 archived；当前该包 status=%s lifecycle=%s（EXPIRED/STALLED 状态与 archived 生命周期在代码中从未被产生）", st, lc))
 	}
 
-	// 对仍 OPEN 的 b2 做「陈旧读」演示：(b) 同 client_msg_id 复用于 sync，新增事件后回放旧结果
-	cA, mA, _ := call(t, srv, http.MethodGet, "/v1/schedule/sync?bundle_id="+b2id+"&since_seq=0", "", "IDEM-SYNC-B2", tokenBob)
-	n0 := len(extractEvents(mA))
-	_, _ = act(t, srv, tokenBob, b2id, "STEP_NOTE", "b2-extra", "")
-	cB, mB, hB := call(t, srv, http.MethodGet, "/v1/schedule/sync?bundle_id="+b2id+"&since_seq=0", "", "IDEM-SYNC-B2", tokenBob)
-	n1 := len(extractEvents(mB))
-	if hB.Get("X-Idempotent-Replay") == "1" && n1 == n0 {
-		rec("DEFECT", "读接口被幂等缓存→陈旧数据",
-			fmt.Sprintf("sync 复用同一 client_msg_id，包内新增事件后第二次仍回放旧缓存（事件数 %d→%d 未变化，带 X-Idempotent-Replay），读接口不应走写接口的 300s 去重", n0, n1))
+	// —— 修复验证（v0.1.10）：MEMBER_REMOVED 明文 remove_member_uids 驱动移出 participant_uids ——
+	// 发起人 Alice 把 Bob 移出 b2 → 200 且即刻失去包内 ACL（全语义 REKEY 连带挂账 §5.3.1）。
+	c, m = act(t, srv, tokenAlice, b2id, "MEMBER_REMOVED", "remove-bob", fmt.Sprintf(`"remove_member_uids":[%q]`, bob.userID))
+	if c != http.StatusOK {
+		rec("DEFECT", "MEMBER_REMOVED 不生效", fmt.Sprintf("发起人移除成员期望 200，实际 %d: %v", c, m))
+	} else {
+		var stillIn bool
+		_ = pool.QueryRow(t.Context(), `SELECT $1::uuid = ANY(participant_uids) FROM bundles WHERE bundle_id=$2`, bob.userID, b2id).Scan(&stillIn)
+		if stillIn {
+			rec("DEFECT", "MEMBER_REMOVED 不生效", "remove_member_uids 已传但被移除者仍在 participant_uids（成员 ACL 只看 participant_uids）")
+		} else if c2, _ := act(t, srv, tokenBob, b2id, "VOTE", "bob-after-remove", ""); c2 != http.StatusForbidden {
+			rec("DEFECT", "MEMBER_REMOVED 不生效", fmt.Sprintf("被移除者后续动作期望 403，实际 %d", c2))
+		}
 	}
-	_ = cA
 
 	// ===== 阶段 6：P2P 瞬时信令 =====
 	// Alice→Bob（好友）可发
-	if c, m := call(t, srv, http.MethodPost, "/v1/relay/msg",
+	if c, m := call2(t, srv, http.MethodPost, "/v1/relay/msg",
 		fmt.Sprintf(`{"recipient_user_id":%q,"kind":"ping","cipher":%q}`, bob.userID, cipherB64("hi-bob")), randomID("m"), tokenAlice); c != http.StatusAccepted {
 		rec("OBSERVATION", "P2P 信令(好友)", fmt.Sprintf("期望 202，实际 %d: %v", c, m))
 	}
-	// Dave 是包成员但不是 Alice 好友 → 直投信令 403（relay 走好友 ACL，与包成员无关）
-	if c, _ := call(t, srv, http.MethodPost, "/v1/relay/msg",
-		fmt.Sprintf(`{"recipient_user_id":%q,"kind":"ping","cipher":%q}`, dave.UserID, cipherB64("hi-dave")), randomID("m"), tokenAlice); c != http.StatusForbidden {
-		rec("OBSERVATION", "P2P 信令(非好友包成员)", fmt.Sprintf("期望 403，实际 %d", c))
+	// Dave 与 Alice 非好友（v0.1.10 后不再被越权拉入包）→ 直投信令 403（relay 走好友 ACL，与包成员无关）
+	if c, _ := call2(t, srv, http.MethodPost, "/v1/relay/msg",
+		fmt.Sprintf(`{"recipient_user_id":%q,"kind":"ping","cipher":%q}`, dave.userID, cipherB64("hi-dave")), randomID("m"), tokenAlice); c != http.StatusForbidden {
+		rec("OBSERVATION", "P2P 信令(非好友)", fmt.Sprintf("期望 403，实际 %d", c))
 	}
 	// Bob 拉取并 ack
-	c, m = call(t, srv, http.MethodGet, "/v1/relay/pending", "", randomID("m"), tokenBob)
+	c, m = call2(t, srv, http.MethodGet, "/v1/relay/pending", "", randomID("m"), tokenBob)
 	if c != http.StatusOK {
 		rec("OBSERVATION", "relay pending", fmt.Sprintf("期望 200，实际 %d: %v", c, m))
 	}
@@ -416,7 +443,7 @@ func TestSimMultiPersonActivity(t *testing.T) {
 		}
 	}
 	if msgID != "" {
-		if c, m := call(t, srv, http.MethodPost, "/v1/relay/ack",
+		if c, m := call2(t, srv, http.MethodPost, "/v1/relay/ack",
 			fmt.Sprintf(`{"message_ids":[%q]}`, msgID), randomID("m"), tokenBob); c != http.StatusOK {
 			rec("OBSERVATION", "relay ack", fmt.Sprintf("期望 200，实际 %d: %v", c, m))
 		}
@@ -425,16 +452,16 @@ func TestSimMultiPersonActivity(t *testing.T) {
 	// ===== 阶段 7：账号 / 会话 =====
 	// 改密 → 纪元+1 → 旧 token 失效
 	oldTok := tokenAlice
-	if c, m := call(t, srv, http.MethodPost, "/v1/auth/change-password",
+	if c, m := call2(t, srv, http.MethodPost, "/v1/auth/change-password",
 		fmt.Sprintf(`{"old_password":%q,"new_password":%q}`, alice.password, "NewPw_999"), randomID("m"), oldTok); c != http.StatusOK {
 		rec("OBSERVATION", "改密", fmt.Sprintf("期望 200，实际 %d: %v", c, m))
 	}
 	// 旧 token 现在应 401（TOKEN_STALE）
-	if c, _ := call(t, srv, http.MethodGet, "/v1/users/me", "", randomID("m"), oldTok); c != http.StatusUnauthorized {
+	if c, _ := call2(t, srv, http.MethodGet, "/v1/users/me", "", randomID("m"), oldTok); c != http.StatusUnauthorized {
 		rec("OBSERVATION", "改密后旧 token", fmt.Sprintf("期望 401，实际 %d", c))
 	}
 	// 旧密码登录失败
-	if c, _ := call(t, srv, http.MethodPost, "/v1/auth/login",
+	if c, _ := call2(t, srv, http.MethodPost, "/v1/auth/login",
 		fmt.Sprintf(`{"username":%q,"password":%q}`, alice.username, alice.password), randomID("m"), ""); c == http.StatusOK {
 		rec("OBSERVATION", "旧密码登录", "旧密码仍登录成功（改密未生效）")
 	}
@@ -444,10 +471,10 @@ func TestSimMultiPersonActivity(t *testing.T) {
 		rec("DEFECT", "新密码登录", "改密后新密码无法登录")
 	}
 	// 登出 → token 被拉黑
-	if c, _ := call(t, srv, http.MethodPost, "/v1/auth/logout", `{}`, randomID("m"), tokenAlice2); c != http.StatusOK {
+	if c, _ := call2(t, srv, http.MethodPost, "/v1/auth/logout", `{}`, randomID("m"), tokenAlice2); c != http.StatusOK {
 		rec("OBSERVATION", "登出", fmt.Sprintf("期望 200，实际 %d", c))
 	}
-	if c, _ := call(t, srv, http.MethodGet, "/v1/users/me", "", randomID("m"), tokenAlice2); c != http.StatusUnauthorized {
+	if c, _ := call2(t, srv, http.MethodGet, "/v1/users/me", "", randomID("m"), tokenAlice2); c != http.StatusUnauthorized {
 		rec("DEFECT", "登出后 token 复用", fmt.Sprintf("登出后旧 token 仍可用，期望 401，实际 %d", c))
 	}
 
@@ -535,6 +562,7 @@ func authVerifyPoW(challenge, solution string, difficulty int) bool {
 }
 
 func sha256Sum(s string) []byte {
-	// 仅在测试构造 PoW 题解时使用；避免额外 import 冲突，直接走 crypto/sha256。
-	return sha256Of(s)
+	// 仅在测试构造 PoW 题解时使用。
+	sum := sha256.Sum256([]byte(s))
+	return sum[:]
 }

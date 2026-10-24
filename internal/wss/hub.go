@@ -256,3 +256,37 @@ func (h *Hub) Publish(bundleID string, seqID int64, action, sender string) {
 		}
 	}
 }
+
+// PushRelay：瞬时信令定向直推（v0.1.8，所有 kind 通用）——收方在线则推，
+// 返回是否至少送达一条连接。与 Publish（bundle 广播）互补：P2P 信令是点对点，
+// 不查 bundle 成员、不走游标；服务端盲转发（header/cipher 不解析）。
+// 发方（httpapi.handleRelaySend）仍先落库（TTL 即焚）——收方 WSS 收到后自行
+// REST ack 消费，防止重连后 pending 重放（MCP 通道依赖此语义去重）。
+func (h *Hub) PushRelay(userID string, msg *relayv1.RelayMessage) bool {
+	frame := &relayv1.ServerFrame{
+		Body: &relayv1.ServerFrame_Relay{Relay: msg},
+	}
+	payload, err := proto.Marshal(frame)
+	if err != nil {
+		slog.Error("序列化 RelayMessage 失败", "err", err)
+		return false
+	}
+	h.mu.RLock()
+	set := h.conns[userID]
+	targets := make([]*conn, 0, len(set))
+	for c := range set {
+		targets = append(targets, c)
+	}
+	h.mu.RUnlock()
+
+	delivered := false
+	for _, c := range targets {
+		if err := c.sendBinary(payload); err != nil {
+			slog.Info("relay 直推失败，摘除连接", "user", userID, "err", err)
+			h.unregister(c)
+			continue
+		}
+		delivered = true
+	}
+	return delivered
+}

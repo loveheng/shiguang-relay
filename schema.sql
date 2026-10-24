@@ -62,7 +62,7 @@ CREATE TABLE bundles (
   status           TEXT NOT NULL DEFAULT 'PROPOSED'
                      CHECK (status IN ('PROPOSED', 'STALLED', 'CONFIRMED', 'CANCELLED', 'EXPIRED')),  -- FSM 状态（协同 §4 转移表）
   lifecycle        TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active', 'archived')),        -- 存储生命周期（§5.7 归档清事件流依据）
-  base_revision    INT NOT NULL DEFAULT 1,       -- 方案整体版本号（§5.4 整包重构校验；事实三动作豁免，v0.1.3）
+  base_revision    INT NOT NULL DEFAULT 1,       -- bundle 级结构版本：每非事实动作自增、expected_revision opt-in 校验（§5.4 案A 2026-10-25；事实三动作豁免 v0.1.3）
   max_seq_id       BIGINT NOT NULL DEFAULT 0,    -- 写事件前 SELECT ... FOR UPDATE 行锁取号（§5.1）
   participant_uids UUID[] NOT NULL,               -- 参与全员（寻址 + participating 拉取权限 ACL）
   expires_at       TIMESTAMPTZ NOT NULL,         -- TTL 超时（§3.6 Soft-Lock / §4.4 EXPIRED 扫描依据）

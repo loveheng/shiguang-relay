@@ -121,6 +121,7 @@ COMPOSE="podman-compose -f docker-compose.prod.yml" bash scripts/ops-cleanup.sh
 | `TICKET_NONCE_USED` / `TICKET_SUBJECT_INVALID` | 400 / 403 | 名片 nonce 重放 / 扫码者非指定人 |
 | `RECIPIENT_NOT_FRIEND` / `RELATION_TERMINATED` | 403 | 非双向好友直投 / 关系已终止 |
 | `NOT_PARTICIPANT` / `NOT_INITIATOR` | 403 | 非方案包成员 / 非发起人操作专属动作 |
+| `INITIATOR_CANNOT_LEAVE` | 403 | 发起人不可 LEAVE（退出先 TRANSFER_INITIATOR，§4.5） |
 | `BUNDLE_NOT_FOUND` / `USER_NOT_FOUND` / `INVITE_NOT_FOUND` | 404 | 资源不存在 |
 | `USER_ALREADY_EXISTS` / `RELATION_EXISTS` | 409 | 重复注册 / 关系已存在 |
 | `USERNAME_INVALID` / `USERNAME_EXISTS` | 400 / 409 | 用户名不合法（3~32 小写字母/数字/下划线）/ 已被占用 |
@@ -128,6 +129,7 @@ COMPOSE="podman-compose -f docker-compose.prod.yml" bash scripts/ops-cleanup.sh
 | `USER_OR_PASSWORD_INVALID` | 401 | 用户名或密码错误（不区分，防账号枚举） |
 | `PASSWORD_MISMATCH` | 401 | 改密时旧密码错误 |
 | `BUNDLE_CONFIRMED_IMMUTABLE` | 409 | 方案包已敲定/取消/过期 |
+| `REOPEN_INVALID_STATE` | 409 | REOPEN 仅限 CONFIRMED 态（PROPOSED/STALLED 上不可重开，§4.3/§4.4） |
 | `STALE_REVISION` | 409 | 因果冲突（事实三动作豁免） |
 | `EXCEED_MAX_MEMBERS` / `EXCEED_ACTIVE_BUNDLES` / `EVENT_QUOTA_EXCEEDED` / `EXCEED_PENDING_INVITES` | 400 | 防爆仓配额族 |
 | `PREKEY_COUNT_INVALID` | 400 | OPK 数量越界（首批 10~20 / 补仓 ≤50） |
@@ -148,4 +150,7 @@ COMPOSE="podman-compose -f docker-compose.prod.yml" bash scripts/ops-cleanup.sh
 - `v0.1.5-contract`（2026-10-09 补丁，加性向后兼容）：团队 E2EE 总纲定盘（collab §5.3.1）——①`Envelope` 补明文外层 `key_ver` + `member_key_envelopes` 字段与 `MemberKeyEnvelope` 消息（收口「解密前无从选钥」缺口）；②新增 `ADD_MEMBER` 动作（中途加人：现役 key_ver 不变、仅追加新人信封、零 REKEY、可看全量历史）；③新增 `bundle_members` 信封落表（第 10 表）+ `GET /v1/bundles/{id}/key-envelopes` 补拉端点；④密钥保留口径修正：K_bundle 保留至 bundle 生命周期终（金库信封长期留存），废「敲定即销毁」表述。
 - `v0.1.6-contract`（2026-10-09 补丁，零字段/零 DDL 行为契约）：①time_anchors 可选 `tz`/`end_tz` 时区锚（cipher 内，缺省本地墙钟零迁移；跨时区行程先折算绝对时刻再运算）；②OPK 空池降级：prekey 恒 200、OPK 空即端侧 4-DH→3-DH（Signal 标准）+ 静默补仓通知；③Wake Push 零知识载荷规范（APNs `content-available`/FCM 纯 data，零明文、本地发声）；④防爆仓硬配额（成员≤16/活跃包≤20/流水≤2000/待审批邀请≤50）；⑤Bundle 终态（CANCELLED/EXPIRED）凭证脱钩转正未归属池（绝不物理删除）；⑥全局错误码字典 + 零明文红线（collab §10.4）。
 - `v0.1.7-contract`（2026-10-11 补丁，加性向后兼容，recovery_vault 换机切片）：①`POST /v1/auth/change-password` 加可选 `new_recovery_vault`（base64）——金库包裹钥改由登录密码派生（schedule-app §11「Plan A v3」拍板，废 v2「独立于登录密码」红线），改密=原子重封，新哈希与新金库密文**单事务同落**（`UpdatePasswordWithVault`），缺省仅换哈希；②`recovery_vault` 信封约定含 KDF 参数与 salt（Argon2id，独立 salt/context，与服务端密码哈希隔离），端侧自解析，服务端仍纯盲。零 DDL 变更。
+- `v0.1.8-contract`（2026-10-14 补丁，加性向后兼容，MCP over relay / 轴 C 最小闭环）：①`RelayMessage` 加 `header`（map<string,string> 明文路由头，服务端盲转发不解析）——`kind="mcp"` 通道约定 `role`/`corr_id`/`token`，`cipher`=JSON-RPC 文本（**MVP 应用层明文，依赖 TLS + 好友 ACL，E2EE 后续切片**）；②瞬时信令补在线直推缺口：`handleRelaySend` 落库成功后经 `Hub.PushRelay` 定向直推 `ServerFrame.relay`（**所有 kind 通用**，收方 WSS 收到后自行 REST ack 消费防 pending 重放；发单响应加 `delivered_online`）。零 DDL 变更；gen/dart 已按本机 protoc_plugin 25.1.0 重生成（配 protobuf 6.x 运行时）。
+- `v0.1.9-contract`（2026-10-25 补丁，加性向后兼容，敲定后生命周期切片）：`ActionType` 增 `PATCH_STEP_TIME`（=28，敲定后单步骤改期轻通道：CONFIRMED 后发起人改单步时间，仅该步骤责任人重确认，包状态不变）/ `LEAVE`（=29，成员自主退出：平权、不触发 REKEY、解挂自己必需步骤；发起人退出走 `TRANSFER_INITIATOR`，新错误码 `INITIATOR_CANNOT_LEAVE`）。`bundles.go` 终态门禁开白名单——二者与下版补入的 `REOPEN` 同为 `BUNDLE_CONFIRMED_IMMUTABLE` 的非终态豁免（仅 CONFIRMED 态放行，CANCELLED/EXPIRED 一律拦）。零 DDL 变更；gen/go + gen/dart 已重生成并同步拾光主仓 `lib/collab/proto/`。~~已知待办：REOPEN 仍被终态门禁拦~~ → 已于 `v0.1.10-contract` 实装销账。
+- `v0.1.10-contract`（2026-10-25 补丁，加性向后兼容，模拟缺陷评估修复切片——sim_activity 7 条 DEFECT 归零）：①`TRANSFER_INITIATOR` 补明文 `transfer_to` 字段（服务端改写 `bundles.initiator_id` 必须见明文 uid；发起人独占 + 目标须为包内成员，否则 403/`NOT_PARTICIPANT`）；②`MEMBER_REMOVED` 补明文 `remove_member_uids` 字段（发起人独占 + 事务内移出 `participant_uids`，被移除者即刻失去包内 ACL，信封行保留供离线回放；**全语义连带 REKEY（key_version+1 重裹 §5.3.1）挂账待切片**）；③`REOPEN` 终态门禁白名单第三动作实装（仅 CONFIRMED 态放行；权限按 `proposal_type` 分流——DIRECTIVE 发起人独占 §4.3 / CONSENSUS 包内平权 §4.4；通过后显式置 `STALLED`，普通动作重新可入——显式门禁转移行，非状态推导；PROPOSED/STALLED 态 REOPEN → 409 `REOPEN_INVALID_STATE` 拦截）；④`ADD_MEMBER` 准入严管（发起人独占 §5.3.1「管理员」+ 每个被加人与发起人双向 accepted，对齐 PROPOSE §1.7）；⑤幂等去重键改 `idem:{method}:{path}:{client_msg_id}`（跨端点不串缓存）+ 幂等中间件 GET 直通（读接口不走 300s 写缓存，杜绝陈旧回放）；⑥`base_revision` 定型 **bundle 级结构版本**（2026-10-25 用户拍板选案 A，§5.4 表述已同步回主仓）：每个非事实动作自增 1、事实三动作豁免维持（v0.1.3，不校验不自增）；校验 **opt-in**——仅显式携带 `expected_revision` 才比对（客户端只在整体重构/结构变更类提交携带），普通平权动作不携带、永不因版本互打回（防 §5.4 惊群）；失败动作不推进计数；靶向实体级冲突判定归端侧 FSM。~~`base_revision` 乐观锁失效为真缺陷挂账待拍板~~ → 案A 已实装销账。以上均零 proto 枚举变更、零 DDL 变更；新错误码仅 `REOPEN_INVALID_STATE`（其余复用 `NOT_INITIATOR`/`NOT_PARTICIPANT`/`INVALID_REQUEST`）；字段为 REST 请求体加性扩展，`Envelope`/`ActionType` 不动。
 - **Phase 0 工程产物（本轮新增，非协议变更）**：仓骨架 `go.mod`/`Dockerfile`/`docker-compose.yml`、生成与验收脚本 `scripts/`、proto 补 `go_package` 选项、`schema.sql` 校准（DDL 唯一出处）。

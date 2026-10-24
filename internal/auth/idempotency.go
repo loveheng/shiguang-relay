@@ -30,6 +30,8 @@ type cachedResponse struct {
 
 // Idempotency：client_msg_id 幂等去重中间件。
 // 首次请求正常执行并缓存响应（SETEX 300s）；窗口内重放同 msg_id 原样回放缓存响应，不再执行业务。
+// 去重键含 method+path（v0.1.10 缺陷修复）：同 msg_id 打不同端点不串缓存；
+// GET 直通（读接口回放缓存=陈旧读毒药，去重只为写重放防护）。
 type Idempotency struct {
 	rdb  *redis.Client
 	ttl  time.Duration
@@ -42,6 +44,10 @@ func NewIdempotency(rdb *redis.Client, ttl, skew time.Duration) *Idempotency {
 
 func (m *Idempotency) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			next.ServeHTTP(w, r)
+			return
+		}
 		msgID := r.Header.Get(HeaderClientMsgID)
 		if msgID == "" {
 			apierr.Write(w, http.StatusBadRequest, apierr.InvalidRequest,
@@ -61,7 +67,7 @@ func (m *Idempotency) Wrap(next http.Handler) http.Handler {
 			return
 		}
 
-		key := idempotencyKey(msgID)
+		key := idempotencyKey(r.Method, r.URL.Path, msgID)
 		if raw, err := m.rdb.Get(r.Context(), key).Result(); err == nil {
 			var c cachedResponse
 			if err := json.Unmarshal([]byte(raw), &c); err == nil {

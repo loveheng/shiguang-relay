@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	relayv1 "shiguang-relay/gen/go"
 	"shiguang-relay/internal/apierr"
 	"shiguang-relay/internal/auth"
 	"shiguang-relay/internal/store"
@@ -27,11 +28,18 @@ var actionTypes = map[string]bool{
 	"ATTACH_FACT": true, "UPDATE_FACT": true, "DETACH_FACT": true,
 	"FREEMASK_QUERY": true, "FREEMASK_RESPONSE": true,
 	"DELIVERY_ACK": true, "CLIENT_ACK": true, "PING": true, "ADD_MEMBER": true,
+	"PATCH_STEP_TIME": true, "LEAVE": true,
 }
 
 // Broadcaster：事件广播。Phase 1.6 实装 WSS Hub；当前为内存空实现（接口先立，逻辑后补）。
 type Broadcaster interface {
 	Publish(bundleID string, seqID int64, action, sender string)
+}
+
+// RelayPusher：瞬时信令在线直推（v0.1.8，所有 kind 通用）。nil 容忍——单测可不注入，
+// 届时退化为纯 REST 拉取（发单响应 delivered_online=false）。
+type RelayPusher interface {
+	PushRelay(userID string, msg *relayv1.RelayMessage) bool
 }
 
 type NoopBroadcaster struct{}
@@ -45,18 +53,20 @@ type envelopeReq struct {
 }
 
 type actionReq struct {
-	BundleID       string          `json:"bundle_id"`
-	Action         string          `json:"action"`
-	Cipher         string          `json:"cipher"`
-	ProposalType   string          `json:"proposal_type"`
-	ParticipantUIDs []string       `json:"participant_uids"`
-	ExpiresAt      *int64          `json:"expires_at"`
-	EncryptedMeta  string          `json:"encrypted_meta"`
-	Topology       json.RawMessage `json:"topology"`
-	Quorum         int             `json:"quorum"`
-	Envelopes      []envelopeReq   `json:"member_key_envelopes"`
-	ExpectedRev    *int            `json:"expected_revision"`
-	AddMembers     []string        `json:"add_member_uids"`
+	BundleID        string          `json:"bundle_id"`
+	Action          string          `json:"action"`
+	Cipher          string          `json:"cipher"`
+	ProposalType    string          `json:"proposal_type"`
+	ParticipantUIDs []string        `json:"participant_uids"`
+	ExpiresAt       *int64          `json:"expires_at"`
+	EncryptedMeta   string          `json:"encrypted_meta"`
+	Topology        json.RawMessage `json:"topology"`
+	Quorum          int             `json:"quorum"`
+	Envelopes       []envelopeReq   `json:"member_key_envelopes"`
+	ExpectedRev     *int            `json:"expected_revision"`
+	AddMembers      []string        `json:"add_member_uids"`
+	RemoveMembers   []string        `json:"remove_member_uids"` // MEMBER_REMOVED（v0.1.10）：明文被移除者
+	TransferTo      string          `json:"transfer_to"`        // TRANSFER_INITIATOR（v0.1.10）：明文新发起人
 }
 
 func (d Deps) handleScheduleAction(w http.ResponseWriter, r *http.Request) {
@@ -103,22 +113,30 @@ func (d Deps) handleScheduleAction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	appendIn := store.AppendInput{
-		BundleID:    req.BundleID,
-		SenderID:    caller,
-		Action:      req.Action,
-		Cipher:      cipher,
-		ClientMsgID: msgID,
-		Topology:    req.Topology,
-		Envelopes:   envelopes,
-		ExpectRev:   req.ExpectedRev,
-		AddMembers:  req.AddMembers,
-		BumpKeyVer:  req.Action == "REKEY",
+		BundleID:      req.BundleID,
+		SenderID:      caller,
+		Action:        req.Action,
+		Cipher:        cipher,
+		ClientMsgID:   msgID,
+		Topology:      req.Topology,
+		Envelopes:     envelopes,
+		ExpectRev:     req.ExpectedRev,
+		AddMembers:    req.AddMembers,
+		RemoveMembers: req.RemoveMembers,
+		TransferTo:    req.TransferTo,
+		BumpKeyVer:    req.Action == "REKEY",
 	}
 	switch req.Action {
 	case "FORCE_FINALIZE":
 		appendIn.SetStatus = "CONFIRMED"
 	case "CANCEL":
 		appendIn.SetStatus = "CANCELLED"
+	case "TRANSFER_INITIATOR":
+		// 服务端改写 bundles.initiator_id 必须见明文 uid（v0.1.10）；缺省即请求形状不合法
+		if req.TransferTo == "" {
+			apierr.Write(w, http.StatusBadRequest, apierr.InvalidRequest, "transfer_to required", nil)
+			return
+		}
 	}
 
 	res, err := d.Bundles.AppendEvent(r.Context(), appendIn)
@@ -133,8 +151,14 @@ func (d Deps) handleScheduleAction(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrNotInitiator):
 		apierr.Write(w, http.StatusForbidden, apierr.NotInitiator, "only initiator may perform this action", nil)
 		return
+	case errors.Is(err, store.ErrInitiatorLeave):
+		apierr.Write(w, http.StatusForbidden, apierr.InitiatorCannotLeave, "initiator cannot leave; transfer ownership first", nil)
+		return
 	case errors.Is(err, store.ErrBundleConfirmed):
 		apierr.Write(w, http.StatusConflict, apierr.BundleConfirmedImmu, "bundle is not open for actions", nil)
+		return
+	case errors.Is(err, store.ErrReopenInvalidState):
+		apierr.Write(w, http.StatusConflict, apierr.ReopenInvalidState, "reopen is only allowed on confirmed bundles", nil)
 		return
 	case errors.Is(err, store.ErrStaleRevision):
 		apierr.Write(w, http.StatusConflict, apierr.StaleRevision, "base revision conflict", nil)

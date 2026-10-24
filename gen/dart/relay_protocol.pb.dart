@@ -1691,6 +1691,7 @@ class RelayMessage extends $pb.GeneratedMessage {
     $core.String? kind,
     $core.List<$core.int>? cipher,
     $fixnum.Int64? expiresAt,
+    $core.Iterable<$core.MapEntry<$core.String, $core.String>>? header,
   }) {
     final result = RelayMessage._();
     if (msgId != null) result.msgId = msgId;
@@ -1699,6 +1700,7 @@ class RelayMessage extends $pb.GeneratedMessage {
     if (kind != null) result.kind = kind;
     if (cipher != null) result.cipher = cipher;
     if (expiresAt != null) result.expiresAt = expiresAt;
+    if (header != null) result.header.addEntries(header);
     return result;
   }
 
@@ -1723,6 +1725,11 @@ class RelayMessage extends $pb.GeneratedMessage {
     ..a<$core.List<$core.int>>(
         5, _omitFieldNames ? '' : 'cipher', $pb.PbFieldType.OY)
     ..aInt64(6, _omitFieldNames ? '' : 'expiresAt')
+    ..m<$core.String, $core.String>(7, _omitFieldNames ? '' : 'header',
+        entryClassName: 'RelayMessage.HeaderEntry',
+        keyFieldType: $pb.PbFieldType.OS,
+        valueFieldType: $pb.PbFieldType.OS,
+        packageName: const $pb.PackageName('shiguang.relay.v1'))
     ..hasRequiredFields = false;
 
   @$core.Deprecated('See https://github.com/google/protobuf.dart/issues/998.')
@@ -1800,6 +1807,17 @@ class RelayMessage extends $pb.GeneratedMessage {
   $core.bool hasExpiresAt() => $_has(5);
   @$pb.TagNumber(6)
   void clearExpiresAt() => $_clearField(6);
+
+  /// v0.1.8 加性扩展：明文路由头（服务端盲转发不解析值，仅透传）。
+  /// `kind="mcp"` 通道约定（MCP over relay，轴 C 最小闭环）：
+  ///   header["role"]    = "req" | "resp"              —— 请求/响应方向
+  ///   header["corr_id"] = 请求方生成的 UUID            —— 请求-响应匹配（双端各自生成，服务端不校验）
+  ///   header["token"]   = MCP x-api-key（仅 req 携带）  —— MCP 层双保险门禁（好友 ACL 之外的第二道）
+  /// cipher = JSON-RPC 2.0 单条消息 UTF-8 文本。
+  /// MVP 口径：应用层暂为明文（依赖 TLS + 好友 ACL；E2EE 后续切片，勿在此基础上传输
+  /// 超出 MCP 会话的敏感数据）。服务端对该通道零解析、只路由。
+  @$pb.TagNumber(7)
+  $pb.PbMap<$core.String, $core.String> get header => $_getMap(6);
 }
 
 /// 瞬时信令拉取确认（v0.1.3）：对应 REST `POST /v1/relay/ack {message_ids}`。

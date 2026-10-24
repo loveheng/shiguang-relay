@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	relayv1 "shiguang-relay/gen/go"
 	"shiguang-relay/internal/apierr"
 	"shiguang-relay/internal/auth"
 )
@@ -191,10 +192,11 @@ func (d Deps) handleVaultList(w http.ResponseWriter, r *http.Request) {
 }
 
 type relaySendReq struct {
-	RecipientUserID string `json:"recipient_user_id"`
-	Kind            string `json:"kind"`
-	Cipher          string `json:"cipher"`
-	TTLSeconds      int    `json:"ttl_seconds"`
+	RecipientUserID string            `json:"recipient_user_id"`
+	Kind            string            `json:"kind"`
+	Cipher          string            `json:"cipher"`
+	TTLSeconds      int               `json:"ttl_seconds"`
+	Header          map[string]string `json:"header"` // v0.1.8：明文路由头（服务端盲转发，仅透传给在线直推帧）
 }
 
 // handleRelaySend：P2P 瞬时信令（非 bundle 事件）。§1.7 第 2 条：无 bundle 的直投信令必须双向好友。
@@ -243,7 +245,21 @@ func (d Deps) handleRelaySend(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, http.StatusInternalServerError, apierr.Internal, "failed to store relay message", nil)
 		return
 	}
-	apierr.WriteJSON(w, http.StatusAccepted, map[string]any{"msg_id": id})
+	// v0.1.8：落库成功后在线直推（所有 kind 通用）。收方 WSS 收到后经 REST ack 消费，
+	// 防重连后 pending 重放；收方不在线则留在 pending（MCP 通道由发方按 delivered_online
+	// 判定「手机不在线即失败」，重连 drain 由收方 ack 丢弃陈旧请求）。
+	delivered := false
+	if d.RelayPusher != nil {
+		delivered = d.RelayPusher.PushRelay(req.RecipientUserID, &relayv1.RelayMessage{
+			MsgId:           id,
+			RecipientUserId: req.RecipientUserID,
+			SenderUserId:    caller,
+			Kind:            kind,
+			Cipher:          blob,
+			Header:          req.Header,
+		})
+	}
+	apierr.WriteJSON(w, http.StatusAccepted, map[string]any{"msg_id": id, "delivered_online": delivered})
 }
 
 func (d Deps) handleRelayPending(w http.ResponseWriter, r *http.Request) {

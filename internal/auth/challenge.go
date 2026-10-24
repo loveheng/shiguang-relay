@@ -109,4 +109,6 @@ func challengeKey(nonce string) string { return "chal:" + nonce }
 
 func ticketNonceKey(issuer, nonce string) string { return "ft:" + issuer + ":" + nonce }
 
-func idempotencyKey(msgID string) string { return "idem:" + msgID }
+func idempotencyKey(method, path, msgID string) string {
+	return "idem:" + method + ":" + path + ":" + msgID
+}

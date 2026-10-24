@@ -258,3 +258,462 @@ func TestProposeRequiresAcceptedFriendship(t *testing.T) {
 		t.Fatalf("拉陌生人建包期望 403，实际 %d", r.StatusCode)
 	}
 }
+
+// 敲定后生命周期白名单（2026-10-25 拍板 §4.3/§4.5）：CONFIRMED 后仅
+// PATCH_STEP_TIME（发起人独占）与 LEAVE（成员平权、发起人禁投）可过终态门禁；
+// CANCELLED 一律拦。
+func TestPatchStepTimeAndLeaveAfterConfirm(t *testing.T) {
+	deps, _ := pgDeps(t)
+	srv := httptest.NewServer(httpapi.NewRouter(deps))
+	defer srv.Close()
+
+	a := registerUser(t, srv, store.MinInitialPreKeys)
+	b := registerUser(t, srv, store.MinInitialPreKeys)
+	makeFriends(t, srv, a, b)
+	tokenA := login(t, srv, a.username, a.password)
+	tokenB := login(t, srv, b.username, b.password)
+
+	res := proposeBundle(t, srv, tokenA, []string{b.userID}, base64.StdEncoding.EncodeToString([]byte("c")))
+	bundleID, _ := res["bundle_id"].(string)
+
+	act := func(token, action string) (int, map[string]any) {
+		body := fmt.Sprintf(`{"bundle_id":%q,"action":%q,"cipher":%q}`,
+			bundleID, action, base64.StdEncoding.EncodeToString([]byte(action)))
+		r := doJSON(t, srv, http.MethodPost, "/v1/schedule/action", body, randomID("m"), token)
+		defer r.Body.Close()
+		var out map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&out)
+		return r.StatusCode, out
+	}
+
+	// 落槌 → CONFIRMED
+	if code, _ := act(tokenA, "FORCE_FINALIZE"); code != http.StatusOK {
+		t.Fatalf("落槌期望 200，实际 %d", code)
+	}
+
+	// 敲定后普通动作仍 409
+	if code, _ := act(tokenA, "ACCEPT"); code != http.StatusConflict {
+		t.Fatalf("敲定后普通动作期望 409，实际 %d", code)
+	}
+
+	// PATCH_STEP_TIME：非发起人 → 403 NOT_INITIATOR
+	code, out := act(tokenB, "PATCH_STEP_TIME")
+	if code != http.StatusForbidden || out["error_code"] != "NOT_INITIATOR" {
+		t.Fatalf("非发起人改期期望 403/NOT_INITIATOR，实际 %d/%v", code, out["error_code"])
+	}
+
+	// PATCH_STEP_TIME：发起人 → 200 且 status 保持 CONFIRMED
+	code, out = act(tokenA, "PATCH_STEP_TIME")
+	if code != http.StatusOK || out["status"] != "CONFIRMED" {
+		t.Fatalf("发起人单步骤改期期望 200/CONFIRMED，实际 %d/%v", code, out["status"])
+	}
+
+	// LEAVE：发起人 → 403 INITIATOR_CANNOT_LEAVE
+	code, out = act(tokenA, "LEAVE")
+	if code != http.StatusForbidden || out["error_code"] != "INITIATOR_CANNOT_LEAVE" {
+		t.Fatalf("发起人退出期望 403/INITIATOR_CANNOT_LEAVE，实际 %d/%v", code, out["error_code"])
+	}
+
+	// LEAVE：成员 → 200，status 保持 CONFIRMED
+	code, out = act(tokenB, "LEAVE")
+	if code != http.StatusOK || out["status"] != "CONFIRMED" {
+		t.Fatalf("成员自主退出期望 200/CONFIRMED，实际 %d/%v", code, out["status"])
+	}
+}
+
+// 终态 CANCELLED 对白名单动作同样关闭（§4.3：CANCELLED/EXPIRED 一律拦）。
+func TestTerminalGateClosesAfterCancel(t *testing.T) {
+	deps, _ := pgDeps(t)
+	srv := httptest.NewServer(httpapi.NewRouter(deps))
+	defer srv.Close()
+
+	a := registerUser(t, srv, store.MinInitialPreKeys)
+	b := registerUser(t, srv, store.MinInitialPreKeys)
+	makeFriends(t, srv, a, b)
+	tokenA := login(t, srv, a.username, a.password)
+	tokenB := login(t, srv, b.username, b.password)
+
+	res := proposeBundle(t, srv, tokenA, []string{b.userID}, base64.StdEncoding.EncodeToString([]byte("c")))
+	bundleID, _ := res["bundle_id"].(string)
+
+	act := func(token, action string) int {
+		body := fmt.Sprintf(`{"bundle_id":%q,"action":%q,"cipher":%q}`,
+			bundleID, action, base64.StdEncoding.EncodeToString([]byte(action)))
+		r := doJSON(t, srv, http.MethodPost, "/v1/schedule/action", body, randomID("m"), token)
+		defer r.Body.Close()
+		return r.StatusCode
+	}
+
+	if code := act(tokenA, "CANCEL"); code != http.StatusOK {
+		t.Fatalf("取消期望 200，实际 %d", code)
+	}
+	for _, action := range []string{"PATCH_STEP_TIME", "LEAVE", "REOPEN"} {
+		if code := act(tokenB, action); code != http.StatusConflict {
+			t.Fatalf("取消后 %s 期望 409，实际 %d", action, code)
+		}
+	}
+}
+
+// proposeTyped：指定 proposal_type 建包（REOPEN 权限分流测试用）。
+func proposeTyped(t *testing.T, srv *httptest.Server, token, ptype string, participants []string, cipher string) map[string]any {
+	t.Helper()
+	uids := make([]string, 0, len(participants))
+	for _, p := range participants {
+		uids = append(uids, fmt.Sprintf("%q", p))
+	}
+	body := fmt.Sprintf(`{"action":"PROPOSE","cipher":%q,"proposal_type":%q,"participant_uids":[%s]}`,
+		cipher, ptype, join(uids))
+	r := doJSON(t, srv, http.MethodPost, "/v1/schedule/action", body, randomID("m"), token)
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("建包期望 201，实际 %d: %s", r.StatusCode, readAll(t, r))
+	}
+	var out map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&out)
+	return out
+}
+
+func actJSON(t *testing.T, srv *httptest.Server, token, bundleID, body string) (int, map[string]any) {
+	t.Helper()
+	r := doJSON(t, srv, http.MethodPost, "/v1/schedule/action", body, randomID("m"), token)
+	defer r.Body.Close()
+	var out map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&out)
+	return r.StatusCode, out
+}
+
+// ADD_MEMBER 准入严管（v0.1.10）：发起人独占 + 被加人与发起人双向 accepted（对齐 PROPOSE §1.7）。
+func TestAddMemberInitiatorOnlyAndFriendAdmission(t *testing.T) {
+	deps, _ := pgDeps(t)
+	srv := httptest.NewServer(httpapi.NewRouter(deps))
+	defer srv.Close()
+
+	a := registerUser(t, srv, store.MinInitialPreKeys) // 发起人
+	b := registerUser(t, srv, store.MinInitialPreKeys) // 包内普通成员
+	c := registerUser(t, srv, store.MinInitialPreKeys) // 与 A 双向好友（可被拉入）
+	d := registerUser(t, srv, store.MinInitialPreKeys) // 与 A 非好友（准入拒绝对象）
+	makeFriends(t, srv, a, b)
+	makeFriends(t, srv, a, c)
+
+	tokenA := login(t, srv, a.username, a.password)
+	tokenB := login(t, srv, b.username, b.password)
+
+	res := proposeBundle(t, srv, tokenA, []string{b.userID}, base64.StdEncoding.EncodeToString([]byte("c")))
+	bundleID, _ := res["bundle_id"].(string)
+	cipher := base64.StdEncoding.EncodeToString([]byte("add"))
+
+	addBody := fmt.Sprintf(`{"bundle_id":%q,"action":"ADD_MEMBER","cipher":%q,"add_member_uids":[%q]}`,
+		bundleID, cipher, d.userID)
+
+	// 普通成员（即便被加人是自己的好友）→ 403 NOT_INITIATOR
+	code, out := actJSON(t, srv, tokenB, bundleID,
+		fmt.Sprintf(`{"bundle_id":%q,"action":"ADD_MEMBER","cipher":%q,"add_member_uids":[%q]}`,
+			bundleID, cipher, c.userID))
+	if code != http.StatusForbidden || out["error_code"] != "NOT_INITIATOR" {
+		t.Fatalf("非发起人加人期望 403/NOT_INITIATOR，实际 %d/%v", code, out["error_code"])
+	}
+
+	// 发起人拉非好友 → 403 NOT_PARTICIPANT（对齐 PROPOSE 准入）
+	code, out = actJSON(t, srv, tokenA, bundleID, addBody)
+	if code != http.StatusForbidden || out["error_code"] != "NOT_PARTICIPANT" {
+		t.Fatalf("拉非好友期望 403/NOT_PARTICIPANT，实际 %d/%v", code, out["error_code"])
+	}
+
+	// 发起人拉双向好友 → 200 且并入 participant_uids
+	code, out = actJSON(t, srv, tokenA, bundleID,
+		fmt.Sprintf(`{"bundle_id":%q,"action":"ADD_MEMBER","cipher":%q,"add_member_uids":[%q]}`,
+			bundleID, cipher, c.userID))
+	if code != http.StatusOK {
+		t.Fatalf("发起人加好友期望 200，实际 %d: %v", code, out)
+	}
+	var inBundle bool
+	if err := deps.Bundles.Pool.QueryRow(t.Context(),
+		`SELECT $1::uuid = ANY(participant_uids) FROM bundles WHERE bundle_id=$2`, c.userID, bundleID).Scan(&inBundle); err != nil {
+		t.Fatal(err)
+	}
+	if !inBundle {
+		t.Fatal("被加人应已并入 participant_uids")
+	}
+}
+
+// TRANSFER_INITIATOR 契约补丁（v0.1.10）：明文 transfer_to 驱动服务端改写 initiator_id；
+// 转移后旧发起人失权、新发起人可落槌。
+func TestTransferInitiatorRewritesInitiator(t *testing.T) {
+	deps, _ := pgDeps(t)
+	srv := httptest.NewServer(httpapi.NewRouter(deps))
+	defer srv.Close()
+
+	a := registerUser(t, srv, store.MinInitialPreKeys)
+	b := registerUser(t, srv, store.MinInitialPreKeys)
+	c := registerUser(t, srv, store.MinInitialPreKeys) // 非成员
+	makeFriends(t, srv, a, b)
+	tokenA := login(t, srv, a.username, a.password)
+	tokenB := login(t, srv, b.username, b.password)
+
+	res := proposeBundle(t, srv, tokenA, []string{b.userID}, base64.StdEncoding.EncodeToString([]byte("c")))
+	bundleID, _ := res["bundle_id"].(string)
+	cipher := base64.StdEncoding.EncodeToString([]byte("t"))
+
+	transfer := func(token, to string) (int, map[string]any) {
+		return actJSON(t, srv, token, bundleID,
+			fmt.Sprintf(`{"bundle_id":%q,"action":"TRANSFER_INITIATOR","cipher":%q,"transfer_to":%q}`,
+				bundleID, cipher, to))
+	}
+
+	// 非发起人发起转移 → 403
+	code, out := transfer(tokenB, b.userID)
+	if code != http.StatusForbidden || out["error_code"] != "NOT_INITIATOR" {
+		t.Fatalf("非发起人转移期望 403/NOT_INITIATOR，实际 %d/%v", code, out["error_code"])
+	}
+
+	// transfer_to 缺失 → 400
+	code, out = actJSON(t, srv, tokenA, bundleID,
+		fmt.Sprintf(`{"bundle_id":%q,"action":"TRANSFER_INITIATOR","cipher":%q}`, bundleID, cipher))
+	if code != http.StatusBadRequest || out["error_code"] != "INVALID_REQUEST" {
+		t.Fatalf("缺 transfer_to 期望 400/INVALID_REQUEST，实际 %d/%v", code, out["error_code"])
+	}
+
+	// transfer_to 非包内成员 → 403 NOT_PARTICIPANT
+	code, out = transfer(tokenA, c.userID)
+	if code != http.StatusForbidden || out["error_code"] != "NOT_PARTICIPANT" {
+		t.Fatalf("转移给非成员期望 403/NOT_PARTICIPANT，实际 %d/%v", code, out["error_code"])
+	}
+
+	// 发起人转移给包内成员 → 200 且 initiator_id 已改写
+	code, _ = transfer(tokenA, b.userID)
+	if code != http.StatusOK {
+		t.Fatalf("转移期望 200，实际 %d", code)
+	}
+	var initiator string
+	if err := deps.Bundles.Pool.QueryRow(t.Context(),
+		`SELECT initiator_id::text FROM bundles WHERE bundle_id=$1`, bundleID).Scan(&initiator); err != nil {
+		t.Fatal(err)
+	}
+	if initiator != b.userID {
+		t.Fatalf("initiator_id 应已改写为 %s，实际 %s", b.userID, initiator)
+	}
+
+	// 旧发起人 CANCEL → 403；新发起人落槌 → 200
+	code, out = actJSON(t, srv, tokenA, bundleID,
+		fmt.Sprintf(`{"bundle_id":%q,"action":"CANCEL","cipher":%q}`, bundleID, cipher))
+	if code != http.StatusForbidden || out["error_code"] != "NOT_INITIATOR" {
+		t.Fatalf("旧发起人 CANCEL 期望 403/NOT_INITIATOR，实际 %d/%v", code, out["error_code"])
+	}
+	code, out = actJSON(t, srv, tokenB, bundleID,
+		fmt.Sprintf(`{"bundle_id":%q,"action":"FORCE_FINALIZE","cipher":%q}`, bundleID, cipher))
+	if code != http.StatusOK || out["status"] != "CONFIRMED" {
+		t.Fatalf("新发起人落槌期望 200/CONFIRMED，实际 %d/%v", code, out["status"])
+	}
+}
+
+// MEMBER_REMOVED 最小修复（v0.1.10）：发起人独占 + 明文 remove_member_uids +
+// 移出 participant_uids（被移除者即刻失去包内 ACL；信封行保留供离线回放；
+// 全语义 REKEY 连带挂账 §5.3.1）。
+func TestMemberRemovedEvictsParticipant(t *testing.T) {
+	deps, _ := pgDeps(t)
+	srv := httptest.NewServer(httpapi.NewRouter(deps))
+	defer srv.Close()
+
+	a := registerUser(t, srv, store.MinInitialPreKeys)
+	b := registerUser(t, srv, store.MinInitialPreKeys)
+	makeFriends(t, srv, a, b)
+	tokenA := login(t, srv, a.username, a.password)
+	tokenB := login(t, srv, b.username, b.password)
+
+	res := proposeBundle(t, srv, tokenA, []string{b.userID}, base64.StdEncoding.EncodeToString([]byte("c")))
+	bundleID, _ := res["bundle_id"].(string)
+	cipher := base64.StdEncoding.EncodeToString([]byte("rm"))
+
+	// 非发起人移除 → 403
+	code, out := actJSON(t, srv, tokenB, bundleID,
+		fmt.Sprintf(`{"bundle_id":%q,"action":"MEMBER_REMOVED","cipher":%q,"remove_member_uids":[%q]}`,
+			bundleID, cipher, a.userID))
+	if code != http.StatusForbidden || out["error_code"] != "NOT_INITIATOR" {
+		t.Fatalf("非发起人移除期望 403/NOT_INITIATOR，实际 %d/%v", code, out["error_code"])
+	}
+
+	// 发起人移除成员 → 200 且移出 participant_uids
+	code, _ = actJSON(t, srv, tokenA, bundleID,
+		fmt.Sprintf(`{"bundle_id":%q,"action":"MEMBER_REMOVED","cipher":%q,"remove_member_uids":[%q]}`,
+			bundleID, cipher, b.userID))
+	if code != http.StatusOK {
+		t.Fatalf("发起人移除期望 200，实际 %d", code)
+	}
+	var stillIn bool
+	if err := deps.Bundles.Pool.QueryRow(t.Context(),
+		`SELECT $1::uuid = ANY(participant_uids) FROM bundles WHERE bundle_id=$2`, b.userID, bundleID).Scan(&stillIn); err != nil {
+		t.Fatal(err)
+	}
+	if stillIn {
+		t.Fatal("被移除者应已移出 participant_uids")
+	}
+
+	// 被移除者后续动作 → 403 NOT_PARTICIPANT
+	code, out = actJSON(t, srv, tokenB, bundleID,
+		fmt.Sprintf(`{"bundle_id":%q,"action":"VOTE","cipher":%q}`, bundleID, cipher))
+	if code != http.StatusForbidden || out["error_code"] != "NOT_PARTICIPANT" {
+		t.Fatalf("被移除者动作期望 403/NOT_PARTICIPANT，实际 %d/%v", code, out["error_code"])
+	}
+
+	// 旧写法（add_member_uids 复用传被移除者）不再生效：无 remove_member_uids 时无人被移出
+	code, _ = actJSON(t, srv, tokenA, bundleID,
+		fmt.Sprintf(`{"bundle_id":%q,"action":"MEMBER_REMOVED","cipher":%q,"add_member_uids":[%q]}`,
+			bundleID, cipher, a.userID))
+	if code != http.StatusOK {
+		t.Fatalf("MEMBER_REMOVED 期望 200，实际 %d", code)
+	}
+	var initiatorIn bool
+	if err := deps.Bundles.Pool.QueryRow(t.Context(),
+		`SELECT $1::uuid = ANY(participant_uids) FROM bundles WHERE bundle_id=$2`, a.userID, bundleID).Scan(&initiatorIn); err != nil {
+		t.Fatal(err)
+	}
+	if !initiatorIn {
+		t.Fatal("add_member_uids 脏复用不应移出成员")
+	}
+}
+
+// REOPEN 终态门禁缺口实装（v0.1.10，§4.3/§4.4）：白名单第三动作，仅 CONFIRMED 态放行；
+// 权限按 proposal_type 分流（DIRECTIVE=发起人独占 / CONSENSUS=包内平权）；
+// 通过后显式置 STALLED，普通动作重新可入（显式门禁转移行，非状态推导）。
+func TestReopenAfterConfirm(t *testing.T) {
+	deps, _ := pgDeps(t)
+	srv := httptest.NewServer(httpapi.NewRouter(deps))
+	defer srv.Close()
+
+	a := registerUser(t, srv, store.MinInitialPreKeys)
+	b := registerUser(t, srv, store.MinInitialPreKeys)
+	makeFriends(t, srv, a, b)
+	tokenA := login(t, srv, a.username, a.password)
+	tokenB := login(t, srv, b.username, b.password)
+	cipher := base64.StdEncoding.EncodeToString([]byte("r"))
+
+	act := func(token, bundleID, action string) (int, map[string]any) {
+		return actJSON(t, srv, token, bundleID,
+			fmt.Sprintf(`{"bundle_id":%q,"action":%q,"cipher":%q}`, bundleID, action, cipher))
+	}
+
+	// —— Directive：REOPEN 发起人独占（§4.3）——
+	res := proposeTyped(t, srv, tokenA, "DIRECTIVE", []string{b.userID}, cipher)
+	dBundle, _ := res["bundle_id"].(string)
+	// 非 CONFIRMED 态（PROPOSED）REOPEN → 409 REOPEN_INVALID_STATE（仅 CONFIRMED 态放行）
+	code, out := act(tokenB, dBundle, "REOPEN")
+	if code != http.StatusConflict || out["error_code"] != "REOPEN_INVALID_STATE" {
+		t.Fatalf("PROPOSED 态 REOPEN 期望 409/REOPEN_INVALID_STATE，实际 %d/%v", code, out["error_code"])
+	}
+	if code, _ := act(tokenA, dBundle, "FORCE_FINALIZE"); code != http.StatusOK {
+		t.Fatalf("落槌期望 200，实际 %d", code)
+	}
+	code, out = act(tokenB, dBundle, "REOPEN")
+	if code != http.StatusForbidden || out["error_code"] != "NOT_INITIATOR" {
+		t.Fatalf("Directive 成员 REOPEN 期望 403/NOT_INITIATOR，实际 %d/%v", code, out["error_code"])
+	}
+	code, out = act(tokenA, dBundle, "REOPEN")
+	if code != http.StatusOK || out["status"] != "STALLED" {
+		t.Fatalf("Directive 发起人 REOPEN 期望 200/STALLED，实际 %d/%v", code, out["status"])
+	}
+	// 重开后普通动作重新可入
+	code, _ = act(tokenB, dBundle, "ACCEPT")
+	if code != http.StatusOK {
+		t.Fatalf("重开后 ACCEPT 期望 200，实际 %d", code)
+	}
+	// STALLED 态不可重复 REOPEN（409 REOPEN_INVALID_STATE，防无意义重开刷流水）
+	code, out = act(tokenA, dBundle, "REOPEN")
+	if code != http.StatusConflict || out["error_code"] != "REOPEN_INVALID_STATE" {
+		t.Fatalf("STALLED 态重复 REOPEN 期望 409/REOPEN_INVALID_STATE，实际 %d/%v", code, out["error_code"])
+	}
+
+	// —— Consensus：REOPEN 包内平权（§4.4）——
+	res = proposeBundle(t, srv, tokenA, []string{b.userID}, cipher)
+	cBundle, _ := res["bundle_id"].(string)
+	if code, _ := act(tokenA, cBundle, "FORCE_FINALIZE"); code != http.StatusOK {
+		t.Fatalf("落槌期望 200，实际 %d", code)
+	}
+	code, out = act(tokenB, cBundle, "REOPEN")
+	if code != http.StatusOK || out["status"] != "STALLED" {
+		t.Fatalf("Consensus 成员 REOPEN 期望 200/STALLED，实际 %d/%v", code, out["status"])
+	}
+
+	// —— CANCELLED 后 REOPEN 同样被终态门禁拦（CONFIRMED→STALLED 仅此一行）——
+	code, _ = act(tokenA, cBundle, "CANCEL")
+	if code != http.StatusOK {
+		t.Fatalf("取消期望 200，实际 %d", code)
+	}
+	code, _ = act(tokenB, cBundle, "REOPEN")
+	if code != http.StatusConflict {
+		t.Fatalf("取消后 REOPEN 期望 409，实际 %d", code)
+	}
+}
+
+// base_revision 案A拍板（2026-10-25，§5.4）：定型 bundle 级结构版本——
+// 每个非事实动作自增 1、事实三动作豁免（不校验不自增，v0.1.3）；校验 opt-in
+// （仅显式携带 expected_revision 才比对，普通平权动作不携带永不互打回，防惊群）。
+func TestBaseRevisionBundleLevelOptIn(t *testing.T) {
+	deps, _ := pgDeps(t)
+	srv := httptest.NewServer(httpapi.NewRouter(deps))
+	defer srv.Close()
+
+	a := registerUser(t, srv, store.MinInitialPreKeys)
+	b := registerUser(t, srv, store.MinInitialPreKeys)
+	makeFriends(t, srv, a, b)
+	tokenA := login(t, srv, a.username, a.password)
+	tokenB := login(t, srv, b.username, b.password)
+
+	res := proposeBundle(t, srv, tokenA, []string{b.userID}, base64.StdEncoding.EncodeToString([]byte("c")))
+	bundleID, _ := res["bundle_id"].(string)
+	cipher := base64.StdEncoding.EncodeToString([]byte("rev"))
+
+	rev := func() int {
+		t.Helper()
+		var r int
+		if err := deps.Bundles.Pool.QueryRow(t.Context(),
+			`SELECT base_revision FROM bundles WHERE bundle_id=$1`, bundleID).Scan(&r); err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+
+	// PROPOSE 落包后基线为 1（seq:1 事件不重复自增）
+	if r := rev(); r != 1 {
+		t.Fatalf("建包后 base_revision 期望 1，实际 %d", r)
+	}
+
+	// 非事实动作不携带 expected_revision（opt-in）→ 200 且恰好自增 1
+	code, out := actJSON(t, srv, tokenB, bundleID,
+		fmt.Sprintf(`{"bundle_id":%q,"action":"VOTE","cipher":%q}`, bundleID, cipher))
+	if code != http.StatusOK {
+		t.Fatalf("不带 expected_revision 的平权动作期望 200，实际 %d: %v", code, out)
+	}
+	if r := rev(); r != 2 {
+		t.Fatalf("一次非事实成功动作后 base_revision 期望 2，实际 %d", r)
+	}
+
+	// 陈旧 expected_revision + 非事实动作 → 409 STALE_REVISION，且失败动作不推进计数
+	code, out = actJSON(t, srv, tokenB, bundleID,
+		fmt.Sprintf(`{"bundle_id":%q,"action":"VOTE","cipher":%q,"expected_revision":1}`, bundleID, cipher))
+	if code != http.StatusConflict || out["error_code"] != "STALE_REVISION" {
+		t.Fatalf("陈旧 revision 期望 409/STALE_REVISION，实际 %d/%v", code, out["error_code"])
+	}
+	if r := rev(); r != 2 {
+		t.Fatalf("被打回的动作不应推进计数，base_revision 期望仍为 2，实际 %d", r)
+	}
+
+	// 当前值 expected_revision + 非事实动作 → 200 且自增（整体重构类携带时的守卫路径）
+	code, _ = actJSON(t, srv, tokenB, bundleID,
+		fmt.Sprintf(`{"bundle_id":%q,"action":"VOTE","cipher":%q,"expected_revision":2}`, bundleID, cipher))
+	if code != http.StatusOK {
+		t.Fatalf("携带当前值的动作期望 200，实际 %d", code)
+	}
+	if r := rev(); r != 3 {
+		t.Fatalf("携带当前值的成功动作后 base_revision 期望 3，实际 %d", r)
+	}
+
+	// 事实动作携带陈旧 expected_revision → 豁免：200 且不推进计数（v0.1.3）
+	code, _ = actJSON(t, srv, tokenB, bundleID,
+		fmt.Sprintf(`{"bundle_id":%q,"action":"ATTACH_FACT","cipher":%q,"expected_revision":1}`, bundleID, cipher))
+	if code != http.StatusOK {
+		t.Fatalf("事实动作豁免期望 200，实际 %d", code)
+	}
+	if r := rev(); r != 3 {
+		t.Fatalf("事实动作不应推进计数，base_revision 期望仍为 3，实际 %d", r)
+	}
+}

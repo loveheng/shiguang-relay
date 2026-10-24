@@ -43,14 +43,16 @@ func newDeps(t *testing.T) httpapi.Deps {
 	issuer.SetEpoch(epochs)
 	issuer.SetDeny(deny)
 	return httpapi.Deps{
-		Issuer:      issuer,
-		Challenges:  auth.NewChallengeStore(rdb, time.Minute, 2),
-		Idem:        auth.NewIdempotency(rdb, 5*time.Minute, 5*time.Minute),
-		Identities:  fakeIdentities{},
-		Credentials: fakeCreds{userID: "user-1"},
-		PoWRequired: true,
-		Deny:        deny,
-		Epochs:      epochs,
+		Issuer:              issuer,
+		Challenges:          auth.NewChallengeStore(rdb, time.Minute, 2),
+		Idem:                auth.NewIdempotency(rdb, 5*time.Minute, 5*time.Minute),
+		Identities:          fakeIdentities{},
+		Credentials:         fakeCreds{userID: "user-1"},
+		Limiter:             auth.NewRateLimiter(rdb, 100, time.Minute),
+		RegisterLimitPerMin: 100,
+		PoWRequired:         true,
+		Deny:                deny,
+		Epochs:              epochs,
 	}
 }
 
@@ -150,6 +152,48 @@ func TestMissingClientMsgIDRejected(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("缺 client_msg_id 期望 400，实际 %d", resp.StatusCode)
+	}
+}
+
+// 幂等去重键作用域（v0.1.10 缺陷修复）：同 client_msg_id 打不同端点不得串缓存；
+// 读接口（GET）直通不缓存。键=idem:{method}:{path}:{client_msg_id}。
+func TestIdempotencyKeyScopedByMethodAndPath(t *testing.T) {
+	deps := newDeps(t)
+	srv := httptest.NewServer(httpapi.NewRouter(deps))
+	defer srv.Close()
+	token := login(t, srv, "user-1", "pass")
+
+	// 跨端点：challenge 先占 msg-id 缓存，login 同 msg-id 不得回放 challenge 响应
+	r1 := doJSON(t, srv, http.MethodPost, "/v1/auth/challenge", `{}`, "scope-id", "")
+	r1.Body.Close()
+	if r1.StatusCode != http.StatusOK {
+		t.Fatalf("challenge 期望 200，实际 %d", r1.StatusCode)
+	}
+	r2 := doJSON(t, srv, http.MethodPost, "/v1/auth/login",
+		`{"username":"user-1","password":"wrong"}`, "scope-id", "")
+	defer r2.Body.Close()
+	if r2.Header.Get(auth.HeaderReplay) == "1" || r2.StatusCode == r1.StatusCode {
+		t.Fatalf("跨端点同 msg-id 串了缓存：login=%d replay=%q", r2.StatusCode, r2.Header.Get(auth.HeaderReplay))
+	}
+
+	// 同端点重放仍生效
+	r3 := doJSON(t, srv, http.MethodPost, "/v1/auth/challenge", `{}`, "scope-id", "")
+	r3.Body.Close()
+	if r3.Header.Get(auth.HeaderReplay) != "1" {
+		t.Fatal("同端点同 msg-id 应命中去重回放")
+	}
+
+	// GET 直通：同 msg-id 两次请求均真实执行（无 replay 头）；这里用 lookup 的
+	// 参数校验分支（不触 DB）判定「确实执行了业务」——两次都应回 USERNAME_INVALID 400
+	g1 := doJSON(t, srv, http.MethodGet, "/v1/users/lookup?username=x", "", "get-scope-id", token)
+	g1.Body.Close()
+	g2 := doJSON(t, srv, http.MethodGet, "/v1/users/lookup?username=x", "", "get-scope-id", token)
+	defer g2.Body.Close()
+	if g1.StatusCode != http.StatusBadRequest || g2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("GET 两次应各自执行业务（期望 400/400），实际 %d/%d", g1.StatusCode, g2.StatusCode)
+	}
+	if g2.Header.Get(auth.HeaderReplay) == "1" {
+		t.Fatal("GET 不应走幂等缓存回放")
 	}
 }
 

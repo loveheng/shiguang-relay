@@ -54,6 +54,9 @@ type Deps struct {
 	Bundles     store.BundlesStore
 	Broadcaster Broadcaster // Phase 1.6 换成 WSS Hub
 
+	// v0.1.8：瞬时信令在线直推（nil 容忍——不注入则纯 REST 拉取）
+	RelayPusher RelayPusher
+
 	// Phase 1.6：WSS（nil 时不挂载 /ws，便于单测只跑 REST）
 	WSS http.Handler
 

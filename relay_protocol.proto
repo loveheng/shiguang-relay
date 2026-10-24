@@ -30,6 +30,21 @@ syntax = "proto3";
 //     缺省本地墙钟零迁移）；②OPK 空池降级 3-DH + 静默补仓通知（Signal 标准口径）；③Wake Push 零知识载荷规范
 //     （APNs/FCM 静默参数 + 零明文红线 + 本地发声）；④防爆仓硬配额（成员≤16/活跃包≤20/流水≤2000/邀请≤50）；
 //     ⑤Bundle 终态（CANCELLED/EXPIRED）凭证脱钩转正未归属池；⑥全局错误码字典（collab §10.4）。
+//   - v0.1.8 (2026-10-14 补丁，加性向后兼容)：MCP over relay（轴 C 最小闭环）——
+//     ①RelayMessage 加 `header`（map<string,string>，明文路由头，服务端盲转发不解析）：
+//     kind="mcp" 通道约定 role/corr_id/token，cipher=JSON-RPC 文本（MVP 应用层明文，
+//     依赖 TLS + 好友 ACL，E2EE 后续切片）；②瞬时信令补在线直推缺口：handleRelaySend
+//     落库成功后经 Hub 定向直推 ServerFrame.relay（所有 kind 通用；在线端零轮询延迟）。
+//   - v0.1.9 (2026-10-25 补丁，加性向后兼容)：敲定后生命周期切片——ActionType 增 PATCH_STEP_TIME(28)/LEAVE(29)
+//     （终态门禁白名单仅有的两个非终态动作；详见 README 契约账 v0.1.9-contract）。
+//   - v0.1.10 (2026-10-25 补丁，REST 请求体加性扩展，零枚举/零 DDL)：模拟缺陷修复切片——
+//     action 请求体增 transfer_to（TRANSFER_INITIATOR 明文新发起人，服务端改写 initiator_id）与
+//     remove_member_uids（MEMBER_REMOVED 明文移出清单，即时生效于 participant_uids；全语义 REKEY 挂账）；
+//     ADD_MEMBER 收敛发起人独占 + 双向 accepted 准入（对齐 PROPOSE §1.7）；REOPEN 入终态门禁白名单
+//     （仅 CONFIRMED 态放行，DIRECTIVE 发起人独占 / CONSENSUS 平权，通过后显式置 STALLED；
+//     非 CONFIRMED 态 409 REOPEN_INVALID_STATE）；base_revision 定型 bundle 级结构版本
+//     （每非事实动作自增、expected_revision opt-in 校验，§5.4 案A 2026-10-25 拍板）。
+//     详见 README 契约账 v0.1.10-contract。
 //   - v0.1.1 (2026-10-09 补丁)：加好友自报家门（identity_key_pub + encrypted_intro）解审批死锁；
 //     ATTACH_FACT 语义定调（FSM 零影响 + 全员平权）；OPK 注册首批仅 10~20 个（瘦身）
 //   - v0.1.0 首版：废除独立 Mailbox API；事实同步并入 bundle 事件流
@@ -108,6 +123,9 @@ enum ActionType {
   CLIENT_ACK = 25;             // 事件游标确认
   PING = 26;
   ADD_MEMBER = 27;             // 中途加人（v0.1.5）：现役 key_ver 不变、仅追加新成员信封（可看全量历史，零 REKEY）
+  // —— 敲定后生命周期（2026-10-25 拍板 §4.3/§4.5；终态门禁白名单仅有的两个非终态动作）——
+  PATCH_STEP_TIME = 28;        // 敲定后单步骤改期轻通道：CONFIRMED 后发起人改单步时间，仅责任人重确认，包状态不变
+  LEAVE = 29;                  // 成员自主退出：平权、不触发 REKEY、解挂自己必需步骤；发起人退出走 TRANSFER_INITIATOR
 }
 
 // ---------------------------------------------------------------------------
@@ -232,9 +250,18 @@ message RelayMessage {
   string msg_id = 1;
   string recipient_user_id = 2;   // 投递目标
   string sender_user_id = 3;
-  string kind = 4;                // ticket_delivery / key_exchange / freemask ...
+  string kind = 4;                // ticket_delivery / key_exchange / freemask / mcp ...
   bytes cipher = 5;               // AEAD，≤256KB 网关硬限
   int64 expires_at = 6;           // TTL 即焚
+  // v0.1.8 加性扩展：明文路由头（服务端盲转发不解析值，仅透传）。
+  // `kind="mcp"` 通道约定（MCP over relay，轴 C 最小闭环）：
+  //   header["role"]    = "req" | "resp"              —— 请求/响应方向
+  //   header["corr_id"] = 请求方生成的 UUID            —— 请求-响应匹配（双端各自生成，服务端不校验）
+  //   header["token"]   = MCP x-api-key（仅 req 携带）  —— MCP 层双保险门禁（好友 ACL 之外的第二道）
+  // cipher = JSON-RPC 2.0 单条消息 UTF-8 文本。
+  // MVP 口径：应用层暂为明文（依赖 TLS + 好友 ACL；E2EE 后续切片，勿在此基础上传输
+  // 超出 MCP 会话的敏感数据）。服务端对该通道零解析、只路由。
+  map<string, string> header = 7;
 }
 
 // 瞬时信令拉取确认（v0.1.3）：对应 REST `POST /v1/relay/ack {message_ids}`。

@@ -81,6 +81,7 @@ func main() {
 
 		Bundles:     store.BundlesStore{Pool: pool},
 		Broadcaster: hub,
+		RelayPusher: hub, // v0.1.8：瞬时信令在线直推
 		WSS:         hub,
 
 		HealthPG:    func(ctx context.Context) error { return pool.Ping(ctx) },
